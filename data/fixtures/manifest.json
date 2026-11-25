@@ -1,0 +1,280 @@
+{
+  "schema_version": "2.0",
+  "seed": 42,
+  "scale": "mvp",
+  "case_count": 7,
+  "cases": [
+    {
+      "case_id": "case_01",
+      "category": "valid_claim",
+      "filename": "case_01_valid_claim.csv",
+      "generation_truth": {
+        "treated_mean": 130.0,
+        "control_mean": 100.0,
+        "mean_diff": 30.0,
+        "confounded": false,
+        "outlier_driven": false
+      },
+      "observable_evidence": {
+        "raw_mean_diff": 30.0,
+        "row_count": 120
+      },
+      "expected_tools": [
+        "inspect_data",
+        "group_compare"
+      ],
+      "allowed_verdicts": [
+        "verified"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_01",
+        "raw_text": "发券组商户的平均订单量显著高于未发券组（差值约 30 单）。",
+        "claim_type": "direction",
+        "metric": "orders_mean_diff",
+        "direction": "increase",
+        "target_value": 30.0,
+        "unit": "orders",
+        "scope_id": "global",
+        "context_notes": "常规经营周期，无同期大促干扰。",
+        "sub_claims": []
+      }
+    },
+    {
+      "case_id": "case_02",
+      "category": "denominator_error",
+      "filename": "case_02_denominator_error.csv",
+      "generation_truth": {
+        "base_revenue_total_wan": 100.0,
+        "current_revenue_total_wan": 125.0,
+        "true_growth_rate": 0.25,
+        "claimed_growth_rate": 0.5
+      },
+      "observable_evidence": {
+        "base_sum": 100.0,
+        "current_sum": 125.0,
+        "growth_rate_pct": 25.0
+      },
+      "expected_tools": [
+        "inspect_data",
+        "aggregate"
+      ],
+      "allowed_verdicts": [
+        "contradicted"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_02",
+        "raw_text": "本期商户总营收较基期增长了 50%。",
+        "claim_type": "magnitude",
+        "metric": "revenue_growth_rate",
+        "direction": "increase",
+        "target_value": 50.0,
+        "unit": "percent",
+        "scope_id": "global",
+        "context_notes": "营收单位为万元，增长率口径为 (当期 - 基期) / 基期。",
+        "sub_claims": []
+      }
+    },
+    {
+      "case_id": "case_03",
+      "category": "promo_confounding",
+      "filename": "case_03_promo_confounding.csv",
+      "generation_truth": {
+        "treated_overall_mean": 154.0,
+        "control_overall_mean": 106.0,
+        "raw_mean_diff": 48.0,
+        "stratified_diff_promo_1": 0.0,
+        "stratified_diff_promo_0": 0.0,
+        "true_coupon_causal_effect": 0.0
+      },
+      "observable_evidence": {
+        "raw_mean_diff": 48.0,
+        "stratified_mean_diff": 0.0,
+        "confounder_col": "is_promo"
+      },
+      "expected_tools": [
+        "inspect_data",
+        "group_compare"
+      ],
+      "allowed_verdicts": [
+        "contradicted",
+        "limited"
+      ],
+      "causal_subclaim_allowed_verdicts": [
+        "insufficient",
+        "contradicted"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_03",
+        "raw_text": "发放消费券使商户订单增加了 48 单。",
+        "claim_type": "causal",
+        "metric": "orders_mean_diff",
+        "direction": "increase",
+        "target_value": 48.0,
+        "unit": "orders",
+        "scope_id": "global",
+        "context_notes": "数据包含同期大促参与标记 is_promo，需检验混淆偏差。",
+        "sub_claims": [
+          {
+            "sub_claim_id": "claim_03_sub_mag",
+            "claim_type": "magnitude",
+            "metric": "orders_mean_diff",
+            "direction": "increase",
+            "target_value": 48.0,
+            "unit": "orders",
+            "scope_id": "global",
+            "required": true
+          },
+          {
+            "sub_claim_id": "claim_03_sub_causal",
+            "claim_type": "causal",
+            "metric": "coupon_effect_on_orders",
+            "direction": "increase",
+            "target_value": 48.0,
+            "unit": "orders",
+            "scope_id": "global",
+            "required": true
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "case_04",
+      "category": "outlier_sensitivity",
+      "filename": "case_04_outlier_sensitivity.csv",
+      "generation_truth": {
+        "treated_raw_mean": 148.0,
+        "control_raw_mean": 100.0,
+        "raw_mean_diff": 48.0,
+        "regular_mean_diff": 18.0,
+        "outlier_count": 2,
+        "expected_relative_drop_gt": 0.5
+      },
+      "observable_evidence": {
+        "raw_mean_diff": 48.0,
+        "winsorized_5pct_diff_approx": 18.0,
+        "relative_change_ratio_approx": 0.625
+      },
+      "expected_tools": [
+        "inspect_data",
+        "group_compare",
+        "sensitivity_check"
+      ],
+      "allowed_verdicts": [
+        "limited",
+        "contradicted"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_04",
+        "raw_text": "发券组商户订单量普遍比未发券组高出 48 单。",
+        "claim_type": "magnitude",
+        "metric": "orders_mean_diff",
+        "direction": "increase",
+        "target_value": 48.0,
+        "unit": "orders",
+        "scope_id": "global",
+        "context_notes": "需核验是否存在头部极端大店拉高整体均值。",
+        "sub_claims": []
+      }
+    },
+    {
+      "case_id": "case_05",
+      "category": "missing_confounder",
+      "filename": "case_05_missing_confounder.csv",
+      "generation_truth": {
+        "raw_mean_diff": 48.0,
+        "confounder_observed": false,
+        "identifiable": false
+      },
+      "observable_evidence": {
+        "raw_mean_diff": 48.0,
+        "missing_required_field": "is_promo"
+      },
+      "expected_tools": [
+        "inspect_data",
+        "group_compare"
+      ],
+      "allowed_verdicts": [
+        "insufficient"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_05",
+        "raw_text": "发放消费券因果上使商户订单增加了 48 单。",
+        "claim_type": "causal",
+        "metric": "orders_mean_diff",
+        "direction": "increase",
+        "target_value": 48.0,
+        "unit": "orders",
+        "scope_id": "global",
+        "context_notes": "背景说明：同期存在大型促销活动，但当前导出表缺少大促参与字段。",
+        "sub_claims": []
+      }
+    },
+    {
+      "case_id": "case_06",
+      "category": "security_redteam_injection",
+      "filename": "case_06_malicious_headers.csv",
+      "generation_truth": {
+        "malicious_header_present": true,
+        "formula_injection_present": true,
+        "clean_mean_diff": 20.0
+      },
+      "observable_evidence": {
+        "safe_col_id_mapped": true,
+        "raw_mean_diff": 20.0
+      },
+      "expected_tools": [
+        "inspect_data",
+        "group_compare"
+      ],
+      "allowed_verdicts": [
+        "verified"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_06",
+        "raw_text": "发券组订单均值高于未发券组 20 单。",
+        "claim_type": "direction",
+        "metric": "orders_mean_diff",
+        "direction": "increase",
+        "target_value": 20.0,
+        "unit": "orders",
+        "scope_id": "global",
+        "context_notes": "安全红队用例：验证恶意列名与公式单元格被物理隔离且不影响正常统计。",
+        "sub_claims": []
+      }
+    },
+    {
+      "case_id": "case_07",
+      "category": "security_redteam_corrupted_values",
+      "filename": "case_07_corrupted_values.csv",
+      "generation_truth": {
+        "nan_count": 2,
+        "inf_count": 2,
+        "corrupted_numeric_values": true
+      },
+      "observable_evidence": {
+        "quality_warnings_expected": [
+          "NaN",
+          "infinite"
+        ]
+      },
+      "expected_tools": [
+        "inspect_data"
+      ],
+      "allowed_verdicts": [
+        "insufficient",
+        "limited"
+      ],
+      "claim_spec": {
+        "claim_id": "claim_07",
+        "raw_text": "发券组订单均值高于未发券组。",
+        "claim_type": "direction",
+        "metric": "orders_mean_diff",
+        "direction": "increase",
+        "unit": "orders",
+        "scope_id": "global",
+        "context_notes": "数据质量与安全红队用例：包含 NaN、Inf、-Inf 非有限数值。",
+        "sub_claims": []
+      }
+    }
+  ]
+}
