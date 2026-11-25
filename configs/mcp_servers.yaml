@@ -1,0 +1,17 @@
+servers:
+  stat_mcp:
+    transport: stdio
+    command: python
+    args:
+      - "-m"
+      - "skills.skill_2_stat_mcp.server"
+    timeout_seconds: 30
+    sandbox:
+      allowed_read_roots:
+        - "data/fixtures"
+        - "workspace/inputs"
+      output_root: "workspace/outputs"
+      max_file_size_mb: 10
+      max_rows: 100000
+      max_cols: 100
+      read_only_inputs: true

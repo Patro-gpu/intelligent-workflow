@@ -1,0 +1,39 @@
+roles:
+  primary_reviewer:
+    provider: deepseek
+    fallback: qwen
+  challenger:
+    provider: doubao
+    fallback: qwen
+  reality_checker:
+    type: deterministic_mcp
+  verdict_engine:
+    type: deterministic_rules
+  final_reviewer:
+    provider: premium
+    enabled: false
+    max_calls: 1
+workflow:
+  max_rounds: 2
+  early_stop: true
+  blind_review: true
+  delta_only_round_2: true
+  max_tool_calls: 12
+  max_task_budget_cny: 1.0
+robustness:
+  warning_change_ratio: 0.20
+  severe_change_ratio: 0.50
+  significance_alpha: 0.05
+pricing_cny_per_1k_tokens:
+  deepseek:
+    input: 0.002
+    output: 0.008
+  doubao:
+    input: 0.001
+    output: 0.004
+  qwen:
+    input: 0.001
+    output: 0.004
+  premium:
+    input: 0.12
+    output: 0.36
