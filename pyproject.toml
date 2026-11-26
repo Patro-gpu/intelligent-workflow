@@ -30,5 +30,5 @@ include = ["core*", "skills*", "workflows*", "data*", "evals*", "app*", "scripts
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
+testpaths = ["tests", "skills"]
 addopts = "-ra"
