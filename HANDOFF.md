@@ -29,6 +29,11 @@
   - `skills/skill_1_data_profiler/`：`skill.py`、`cli.py`（`/inspect`）、`README.md`、`tests/test_skill_1.py`
   - `skills/skill_2_stat_mcp/`：`engine.py`（5 个确定性工具 + `EvidenceRecord` 账本持久化）、`server.py`（官方 `FastMCP` stdio 包装，待 Python 3.11+ 环境安装 `mcp` 后直接运行）、`cli.py`（`/verify`）、`README.md`、`tests/test_skill_2.py`
   - 全量 `pytest -v`：**36 / 36 全部通过**，密钥扫描 **0 告警**（仅余 `core/mcp_client.py` 与 `tests/test_mcp_protocol.py` 需在 Python 3.11+ 下联调真实 stdio 协议）
+- [x] **B3 — 6 阶段有界状态机、`/audit` 命令行入口与 T01–T12 全套验收（`feat/step-5-state-machine-and-acceptance` → `--no-ff` 合并入 `dev`）**
+  - `workflows/state_machine.py`：6 阶段有界状态机、`should_escalate()` 12 项门控、`build_blinded_judge_input()` 盲化随机排序、同 `request_key` 零重复执行、`review_closed`/`judge_closed` 不可逆守卫、自动落盘 `report.md`/`verdict.json`/`trace.json`
+  - `workflows/cli.py`：`/audit` 风格 CLI 入口
+  - `tests/test_verdict_acceptance.py`：**T01–T12 全部 12 项验收 + 6 条全局强制不变量 + `/audit` 端到端测试通过**
+  - 全量 `pytest -v`：**49 / 49 全部通过**，密钥扫描 **0 告警**
 
 > **环境说明**：阶段 A 起盘机默认系统 Python 为 `3.9.6`，已在 `.venv` 安装 `pydantic>=2.0`, `pandas`, `numpy`, `scipy`, `pyyaml`, `python-dotenv`, `openai`, `pytest` 并跑通全量测试。`mcp` 官方包要求 Python `>=3.10`（`pyproject.toml` 声明 `>=3.11`），请阶段 B 开发者在 **Python 3.11+** 环境中执行 `pip install -e ".[ui]"` 一次性安装全部依赖（含 `mcp` 与 `streamlit`）。
 
