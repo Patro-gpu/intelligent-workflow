@@ -34,6 +34,12 @@
   - `workflows/cli.py`：`/audit` 风格 CLI 入口
   - `tests/test_verdict_acceptance.py`：**T01–T12 全部 12 项验收 + 6 条全局强制不变量 + `/audit` 端到端测试通过**
   - 全量 `pytest -v`：**49 / 49 全部通过**，密钥扫描 **0 告警**
+- [x] **B4 — 20 份完整基准集、4 组消融评测（R0/R1/R2/R5）、极简观测台与终版文档（`feat/step-6-7-evals-and-dashboard` → `--no-ff` 合并入 `dev`）**
+  - `data/generate_benchmark.py --scale full`：生成 `data/fixtures_full/` 20 份分层评测集与 `manifest.json`
+  - `evals/metrics.py` & `evals/run_ablation.py`：实现 R0/R1/R2/R5 四组消融（20 份 MOCK 实测：R5 准确率 `100.0%` vs R2 `60.0%` vs R0 `40.0%` vs R1 `25.0%`，误判 `verified` 率 `0.0%`），输出 Markdown 对比表与 CSV
+  - `app/dashboard.py`：极简 Streamlit 过程观测台（`<= 250` 行，支持内置反转案例、自定义上传、R2 vs R5 对比、证据账本与 6 不变量徽章）
+  - `README.md`：补齐 Mermaid 架构图、ThinkClaw 升级对比、4 个独立 Skill 运行指令、消融实验指令与《5 分钟随机抽签答辩速查提纲》
+  - 全量 `pytest -v`：**52 / 52 全部通过**，密钥扫描 **0 告警**（仅余 `core/mcp_client.py` 真实 `stdio` 客户端与 `tests/test_mcp_protocol.py` 待 Python 3.11+ 环境安装 `mcp>=1.0` 后联调）
 
 > **环境说明**：阶段 A 起盘机默认系统 Python 为 `3.9.6`，已在 `.venv` 安装 `pydantic>=2.0`, `pandas`, `numpy`, `scipy`, `pyyaml`, `python-dotenv`, `openai`, `pytest` 并跑通全量测试。`mcp` 官方包要求 Python `>=3.10`（`pyproject.toml` 声明 `>=3.11`），请阶段 B 开发者在 **Python 3.11+** 环境中执行 `pip install -e ".[ui]"` 一次性安装全部依赖（含 `mcp` 与 `streamlit`）。
 

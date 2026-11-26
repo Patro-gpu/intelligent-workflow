@@ -9,6 +9,7 @@ servers:
     sandbox:
       allowed_read_roots:
         - "data/fixtures"
+        - "data/fixtures_full"
         - "workspace/inputs"
       output_root: "workspace/outputs"
       max_file_size_mb: 10
