@@ -25,6 +25,10 @@
   - `skills/skill_3_claim_planner/`：`skill.py`、`cli.py`（`/challenge`）、`README.md`、`tests/test_skill_3.py`
   - `skills/skill_4_evidence_auditor/`：`skill.py`、`cli.py`（`/report`）、`README.md`、`tests/test_skill_4.py`
   - 全量 `pytest -v`（自动发现 `tests/` + `skills/`）：**26 / 26 全部通过（0 告警）**，密钥扫描 **0 告警**
+- [x] **B1（核心部分）— 独立 Skill 1（数据体检）+ Skill 2（5 个白名单确定性统计引擎、FastMCP stdio 包装与 `/verify` CLI）（`feat/step-3-profiler-and-engine` → `--no-ff` 合并入 `dev`）**
+  - `skills/skill_1_data_profiler/`：`skill.py`、`cli.py`（`/inspect`）、`README.md`、`tests/test_skill_1.py`
+  - `skills/skill_2_stat_mcp/`：`engine.py`（5 个确定性工具 + `EvidenceRecord` 账本持久化）、`server.py`（官方 `FastMCP` stdio 包装，待 Python 3.11+ 环境安装 `mcp` 后直接运行）、`cli.py`（`/verify`）、`README.md`、`tests/test_skill_2.py`
+  - 全量 `pytest -v`：**36 / 36 全部通过**，密钥扫描 **0 告警**（仅余 `core/mcp_client.py` 与 `tests/test_mcp_protocol.py` 需在 Python 3.11+ 下联调真实 stdio 协议）
 
 > **环境说明**：阶段 A 起盘机默认系统 Python 为 `3.9.6`，已在 `.venv` 安装 `pydantic>=2.0`, `pandas`, `numpy`, `scipy`, `pyyaml`, `python-dotenv`, `openai`, `pytest` 并跑通全量测试。`mcp` 官方包要求 Python `>=3.10`（`pyproject.toml` 声明 `>=3.11`），请阶段 B 开发者在 **Python 3.11+** 环境中执行 `pip install -e ".[ui]"` 一次性安装全部依赖（含 `mcp` 与 `streamlit`）。
 
