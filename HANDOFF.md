@@ -20,6 +20,11 @@
   - `core/llm_router.py` & `scripts/ping_models.py`：OpenAI 兼容多模型路由、`MOCK_MODE=true` 离线可测、预算硬上限熔断（`BudgetExceededError`）、`Qwen` 降级与 `model_diversity_lost` 检测、脱敏 JSONL 审计日志
   - `data/generate_benchmark.py` & `data/fixtures/`：固定 `seed=42` 生成 7 份标准测试 CSV 与 `manifest.json`（精准验证 Case 03 总均值 154 vs 106 差 48 且分层差为 0；Case 04 原始差 48 且 5% 缩尾衰减 > 50%）
   - `tests/test_smoke.py` + `tests/test_core_contracts.py`：**15 / 15 `pytest` 全部通过**
+- [x] **B2 — 外置提示词模板、独立 Skill 3（命题冻结与双轮规划）与独立 Skill 4（确定性裁决引擎）（`feat/step-4-planner-and-auditor` → `--no-ff` 合并入 `dev`）**
+  - `configs/prompts/`：`claim_parser.md`、`primary_reviewer.md`、`challenger.md`、`final_judge.md`（严格三权分立）
+  - `skills/skill_3_claim_planner/`：`skill.py`、`cli.py`（`/challenge`）、`README.md`、`tests/test_skill_3.py`
+  - `skills/skill_4_evidence_auditor/`：`skill.py`、`cli.py`（`/report`）、`README.md`、`tests/test_skill_4.py`
+  - 全量 `pytest -v`（自动发现 `tests/` + `skills/`）：**26 / 26 全部通过（0 告警）**，密钥扫描 **0 告警**
 
 > **环境说明**：阶段 A 起盘机默认系统 Python 为 `3.9.6`，已在 `.venv` 安装 `pydantic>=2.0`, `pandas`, `numpy`, `scipy`, `pyyaml`, `python-dotenv`, `openai`, `pytest` 并跑通全量测试。`mcp` 官方包要求 Python `>=3.10`（`pyproject.toml` 声明 `>=3.11`），请阶段 B 开发者在 **Python 3.11+** 环境中执行 `pip install -e ".[ui]"` 一次性安装全部依赖（含 `mcp` 与 `streamlit`）。
 
