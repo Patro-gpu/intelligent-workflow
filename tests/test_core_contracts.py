@@ -205,7 +205,16 @@ def test_resolve_safe_path_blocks_traversal_and_symlink_escape(tmp_path: Path) -
 
     # 符号链接逃逸拦截
     escape_link = allowed / "evil_link.csv"
-    escape_link.symlink_to(secret_file)
+    try:
+        escape_link.symlink_to(secret_file)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        # Windows without SeCreateSymbolicLinkPrivilege still supports directory junctions.
+        import _winapi
+        junction = allowed / "linked_dir"
+        _winapi.CreateJunction(str(outside), str(junction))
+        escape_link = junction / secret_file.name
     with pytest.raises(SecurityError):
         resolve_safe_path(escape_link, [allowed])
 
@@ -220,6 +229,21 @@ def test_sanitize_cell_for_export_escapes_formula_injection() -> None:
     assert sanitize_cell_for_export(123.45) == 123.45
 
 
+def test_csv_registration_limits_and_immutable_dataset_identity(tmp_path: Path) -> None:
+    path = tmp_path / "input.csv"
+    registry = DatasetRegistry([tmp_path], max_rows=1, max_cols=2)
+    path.write_text("count,n\n1,2\n", encoding="utf-8")
+    original = registry.register_csv(path, "registered")
+    path.write_text("count,n\n1,3\n", encoding="utf-8")
+    with pytest.raises(SecurityError):
+        registry.register_csv(path, "registered")
+    assert registry.get_profile("registered").dataset_hash == original.dataset_hash
+    for oversized in ("a,b,c\n1,2,3\n", "a,b\n1,2\n3,4\n"):
+        path.write_text(oversized, encoding="utf-8")
+        with pytest.raises(SecurityError):
+            registry.register_csv(path)
+
+
 def test_dataset_registry_isolates_case_06_malicious_headers_and_detects_case_07_corrupted() -> None:
     registry = DatasetRegistry(allowed_roots=[FIXTURES_DIR])
 
@@ -229,6 +253,7 @@ def test_dataset_registry_isolates_case_06_malicious_headers_and_detects_case_07
     assert list(df_06.columns) == ["col_01", "col_02", "col_03", "col_04"]
     assert all(col.col_id.startswith("col_") for col in profile_06.columns)
     assert any("suspicious header" in w for w in profile_06.quality_warnings)
+    assert profile_06.columns[1].sanitized_name == "col_02"
     assert any("formula-prefixed" in w for w in profile_06.quality_warnings)
     # 验证恶意单元格可安全转义
     raw_evil_cell = str(df_06.loc[0, "col_02"])

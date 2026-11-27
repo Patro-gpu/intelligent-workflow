@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from core.security import resolve_safe_path, sandbox_root
 from core.schema import ClaimSpec, WorkflowState  # noqa: E402
 from skills.skill_4_evidence_auditor.skill import (  # noqa: E402
     build_audit_verdict,
@@ -27,13 +28,16 @@ from skills.skill_4_evidence_auditor.skill import (  # noqa: E402
 )
 
 
+OUTPUT_ROOT = REPO_ROOT / "workspace/outputs"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Skill 4: Deterministic verdict engine & evidence audit report CLI.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     rep = subparsers.add_parser("report", help="Run deterministic rule evaluation and render Markdown report.")
     rep.add_argument("--input", required=True, help="JSON bundle containing claim_spec and workflow_state")
-    rep.add_argument("--output", default=None, help="Optional output path for Markdown report")
+    rep.add_argument("--output", default=None, help="Markdown report path relative to workspace/outputs")
     rep.add_argument("--json-verdict", action="store_true", help="Print AuditVerdict JSON instead of Markdown")
 
     args = parser.parse_args(argv)
@@ -51,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
             text = render_markdown_report(claim_spec, verdict, evaluated)
 
         if args.output:
-            out_path = Path(args.output)
+            root = sandbox_root(OUTPUT_ROOT)
+            out_path = resolve_safe_path(root / args.output, [root])
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(text, encoding="utf-8")
         else:

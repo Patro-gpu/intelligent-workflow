@@ -34,18 +34,7 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
-PLACEHOLDER_MARKERS = (
-    "your_",
-    "replace_me",
-    "placeholder",
-    "example",
-    "dummy",
-    "mock",
-    "fake",
-    "test_key",
-    "xxxx",
-    "changeme",
-)
+PLACEHOLDER = re.compile(r"your_[a-z]+_api_key_here|sk-mock-dummy-key-1234567890")
 
 IGNORED_EXTENSIONS = {
     ".png",
@@ -63,14 +52,8 @@ IGNORED_EXTENSIONS = {
     ".dylib",
 }
 
-IGNORED_PATHS = {
-    "scripts/check_secrets.py",
-}
-
-
 def _is_placeholder(value: str) -> bool:
-    lowered = value.strip().lower()
-    return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
+    return PLACEHOLDER.fullmatch(value) is not None
 
 
 def _scan_text(text: str, source_label: str) -> list[str]:
@@ -90,58 +73,37 @@ def _git_command(args: list[str]) -> str:
         ["git", *args],
         cwd=REPO_ROOT,
         capture_output=True,
-        text=True,
-        check=False,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
     )
-    if proc.returncode != 0:
-        return ""
     return proc.stdout
 
 
-def _collect_files() -> list[Path]:
-    tracked = _git_command(["ls-files"]).splitlines()
-    untracked = _git_command(["ls-files", "--others", "--exclude-standard"]).splitlines()
-    rel_paths = sorted(set(p for p in (*tracked, *untracked) if p))
-    files: list[Path] = []
-    for rel in rel_paths:
-        if rel in IGNORED_PATHS:
-            continue
-        p = REPO_ROOT / rel
-        if not p.is_file():
-            continue
-        if p.suffix.lower() in IGNORED_EXTENSIONS:
-            continue
-        files.append(p)
-    return files
+def _scan_blob(data: bytes, label: str) -> list[str]:
+    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8"
+    return _scan_text(data.decode(encoding, errors="replace"), label)
 
 
 def scan_repository() -> list[str]:
     findings: list[str] = []
 
-    # 1. Scan staged diff
-    staged_diff = _git_command(["diff", "--cached", "--unified=0"])
-    if staged_diff:
-        added_lines: list[str] = []
-        current_file = "<staged>"
-        for raw_line in staged_diff.splitlines():
-            if raw_line.startswith("+++ b/"):
-                current_file = raw_line[6:]
-                continue
-            if current_file in IGNORED_PATHS:
-                continue
-            if raw_line.startswith("+") and not raw_line.startswith("+++"):
-                added_lines.append((current_file, raw_line[1:]))
-        for fname, content in added_lines:
-            findings.extend(_scan_text(content, f"staged:{fname}"))
+    # Read the index, even if the staged content differs from the worktree.
+    staged = _git_command(["diff", "--cached", "--name-only", "--diff-filter=ACMRT", "-z"])
+    for rel in filter(None, staged.split("\0")):
+        if Path(rel).suffix.lower() not in IGNORED_EXTENSIONS:
+            data = subprocess.check_output(["git", "show", f":{rel}"], cwd=REPO_ROOT)
+            findings.extend(_scan_blob(data, f"staged:{rel}"))
 
-    # 2. Scan tracked & non-ignored working tree files
-    for file_path in _collect_files():
-        rel = file_path.relative_to(REPO_ROOT).as_posix()
-        try:
-            text = file_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        findings.extend(_scan_text(text, rel))
+    paths = _git_command(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    for rel in filter(None, paths.split("\0")):
+        file_path = REPO_ROOT / rel
+        if (file_path.name.startswith(".env") and file_path.name != ".env.example") or (
+            rel.startswith("workspace/inputs/") and file_path.name != ".gitkeep"
+        ):
+            findings.append(f"{rel}: private runtime input must not be committed")
+        if file_path.is_file() and not file_path.is_symlink() and file_path.suffix.lower() not in IGNORED_EXTENSIONS:
+            findings.extend(_scan_blob(file_path.read_bytes(), rel))
 
     # Deduplicate preserving order
     return list(dict.fromkeys(findings))

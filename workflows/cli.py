@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     audit_p.add_argument("--data", required=True, help="Path to CSV inside allowed read roots")
     audit_p.add_argument("--claim", required=True, help="Natural-language claim to verify")
     audit_p.add_argument("--context", default="", help="Optional context notes")
-    audit_p.add_argument("--budget", type=float, default=1.0, help="Hard task budget in CNY (default: 1.0)")
+    audit_p.add_argument("--budget", type=float, default=None, help="Optional lower task budget in CNY")
     audit_p.add_argument("--trace", action="store_true", help="Print execution trace summary")
     audit_p.add_argument("--enable-final-judge", action="store_true", help="Enable optional blinded final judge")
     audit_p.add_argument("--live", action="store_true", help="Use live LLM APIs (default: MOCK_MODE=true)")
@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "audit":
-        router = LLMRouter(mock_mode=not args.live, max_budget_cny=args.budget)
+        router = LLMRouter(mock_mode=not args.live)
         runner = AuditWorkflowRunner(
             router=router,
             final_judge_enabled=args.enable_final_judge,

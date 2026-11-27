@@ -82,9 +82,14 @@ python -m workflows.cli audit \
 python data/generate_benchmark.py --scale full
 python -m evals.run_ablation --scale full
 
+# 配好仓库 .env 后，使用真实 API 运行同一组对照实验
+python -m evals.run_ablation --scale mvp --live --budget-cny 1.0
+
 # 3. 启动极简 Streamlit 过程观测台
 streamlit run app/dashboard.py
 ```
+
+离线模式也会为每次审计启动本地统计 MCP 子进程。在线模式下，R1 调用初审模型，R2 使用单模型加 MCP，R5 使用双模型加 MCP。四组共享本次在线实验预算，`--budget-cny` 只能调低 `MAX_TASK_BUDGET_CNY`。路由器按 `configs/models.yaml` 的单价对每次请求预留费用，重试和 Qwen 降级也经过预算检查。完成的在线报告在 `workspace/outputs/evals/live/`，离线报告在其上一级目录。
 
 ---
 

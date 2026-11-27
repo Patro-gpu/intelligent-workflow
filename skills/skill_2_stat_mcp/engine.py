@@ -28,7 +28,7 @@ from core.schema import (
     canonical_json,
     compute_request_key,
 )
-from core.security import DatasetRegistry, SecurityError, resolve_safe_path
+from core.security import DatasetRegistry, SecurityError, resolve_safe_path, sandbox_root, validate_run_id
 from skills.skill_1_data_profiler.skill import (
     REPO_ROOT,
     build_default_registry,
@@ -93,15 +93,19 @@ def _compute_group_diff(
     ci_low: Optional[float] = None
     ci_high: Optional[float] = None
 
-    if len(treated) >= 2 and len(control) >= 2:
-        t_res = stats.ttest_ind(treated, control, equal_var=False)
-        p_value = _safe_float(t_res.pvalue)
-        se = float(
-            np.sqrt(np.var(treated, ddof=1) / len(treated) + np.var(control, ddof=1) / len(control))
-        )
-        if np.isfinite(se) and se > 0:
-            ci_low = _safe_float(diff - 1.96 * se)
-            ci_high = _safe_float(diff + 1.96 * se)
+    if metric == "mean" and len(treated) >= 2 and len(control) >= 2:
+        # Welch inference for the mean difference. Medians and pairs of
+        # constant samples have no such standard error.
+        vt = float(np.var(treated, ddof=1) / len(treated))
+        vc = float(np.var(control, ddof=1) / len(control))
+        variance = vt + vc
+        if np.isfinite(variance) and variance > 0:
+            se = float(np.sqrt(variance))
+            df = 1 / ((vt / variance) ** 2 / (len(treated) - 1) + (vc / variance) ** 2 / (len(control) - 1))
+            p_value = _safe_float(2 * stats.t.sf(abs(diff) / se, df))
+            margin = float(stats.t.ppf(0.975, df) * se)
+            ci_low = _safe_float(diff - margin)
+            ci_high = _safe_float(diff + margin)
 
     return {
         "treated_n": int(len(treated)),
@@ -119,10 +123,10 @@ def _split_binary_groups(
     df: pd.DataFrame,
     target_col_id: str,
     group_col_id: str,
-) -> Tuple[np.ndarray, np.ndarray, str, str]:
+) -> Tuple[np.ndarray, np.ndarray, Any, Any]:
     valid_groups = df[group_col_id].dropna().unique().tolist()
-    if len(valid_groups) < 2:
-        raise ValueError(f"Group column '{group_col_id}' must contain at least 2 distinct groups")
+    if len(valid_groups) != 2:
+        raise ValueError(f"Group column '{group_col_id}' must contain exactly 2 distinct groups")
 
     # 优先使用 1 vs 0（发券组 vs 未发券组），否则按排序末组减首组
     if 1 in valid_groups and 0 in valid_groups:
@@ -135,7 +139,7 @@ def _split_binary_groups(
 
     treated = _finite_numeric(df.loc[df[group_col_id] == treated_key, target_col_id])
     control = _finite_numeric(df.loc[df[group_col_id] == control_key, target_col_id])
-    return treated, control, str(treated_key), str(control_key)
+    return treated, control, treated_key, control_key
 
 
 class StatAuditEngine:
@@ -148,7 +152,7 @@ class StatAuditEngine:
         output_root: str | Path = REPO_ROOT / "workspace/outputs",
     ) -> None:
         self.registry = registry or build_default_registry()
-        self.output_root = Path(output_root).expanduser().resolve()
+        self.output_root = sandbox_root(output_root)
         self._ledgers: Dict[str, Dict[str, EvidenceRecord]] = {}
         self._request_cache: Dict[Tuple[str, str], str] = {}
 
@@ -178,7 +182,10 @@ class StatAuditEngine:
         cache_key = (run_id, req_hash)
         if cache_key in self._request_cache:
             existing_id = self._request_cache[cache_key]
-            return self._ledgers[run_id][existing_id]
+            existing = self._ledgers[run_id][existing_id]
+            if existing.claim_id != claim_id:
+                raise ValueError("Request already bound to a different claim")
+            return existing
 
         res_hash = hashlib.sha256(canonical_json(result).encode("utf-8")).hexdigest()
         ev_id = f"ev_{req_hash[:12]}"
@@ -201,17 +208,18 @@ class StatAuditEngine:
             result_hash=res_hash,
         )
 
+        self._persist_record(run_id, record)
         self._ledgers.setdefault(run_id, {})[ev_id] = record
         self._request_cache[cache_key] = ev_id
-        self._persist_record(run_id, record)
         return record
 
     def _persist_record(self, run_id: str, record: EvidenceRecord) -> None:
-        safe_run_id = "".join(ch for ch in run_id if ch.isalnum() or ch in ("-", "_")) or "default_run"
-        target_dir = self.output_root / safe_run_id
+        target_dir = sandbox_root(self.output_root / validate_run_id(run_id))
         target_dir.mkdir(parents=True, exist_ok=True)
-        ledger_file = resolve_safe_path(target_dir / "evidence_ledger.jsonl", [self.output_root])
-        with ledger_file.open("a", encoding="utf-8") as fh:
+        ledger_file = resolve_safe_path(target_dir / "evidence_ledger.jsonl", [target_dir])
+        # A new engine never appends to an older or concurrently owned run.
+        mode = "a" if run_id in self._ledgers else "x"
+        with ledger_file.open(mode, encoding="utf-8") as fh:
             fh.write(record.model_dump_json() + "\n")
 
     # ------------------------------------------------------------------
@@ -273,6 +281,10 @@ class StatAuditEngine:
         if filters:
             for col_id, expected_val in filters.items():
                 self._validate_col(dataset_id, col_id)
+                if not isinstance(expected_val, (str, bool, int, float)) or (
+                    isinstance(expected_val, float) and not np.isfinite(expected_val)
+                ):
+                    raise ValueError("Filter values must be finite JSON scalars")
                 df = df[df[col_id] == expected_val]
                 applied_filters[col_id] = expected_val
 
@@ -350,18 +362,17 @@ class StatAuditEngine:
             "target_col_id": target_col_id,
             "group_col_id": group_col_id,
             "metric": metric,
-            "treated_group": t_label,
-            "control_group": c_label,
+            "treated_group": str(t_label),
+            "control_group": str(c_label),
             **overall,
         }
         limitations: List[str] = []
 
         if stratify_col_id is not None:
             strata_results: List[Dict[str, Any]] = []
-            for sval in sorted(df[stratify_col_id].dropna().unique().tolist(), key=lambda x: str(x)):
-                sub_df = df[df[stratify_col_id] == sval]
-                sub_t = _finite_numeric(sub_df.loc[sub_df[group_col_id].astype(str) == t_label, target_col_id])
-                sub_c = _finite_numeric(sub_df.loc[sub_df[group_col_id].astype(str) == c_label, target_col_id])
+            for sval, sub_df in df.groupby(stratify_col_id, sort=True, dropna=True):
+                sub_t = _finite_numeric(sub_df.loc[sub_df[group_col_id] == t_label, target_col_id])
+                sub_c = _finite_numeric(sub_df.loc[sub_df[group_col_id] == c_label, target_col_id])
                 sub_stats = _compute_group_diff(sub_t, sub_c, metric)
                 strata_results.append({"stratum": str(sval), **sub_stats})
             result["stratify_col_id"] = stratify_col_id
@@ -465,8 +476,8 @@ class StatAuditEngine:
             result={
                 "target_col_id": target_col_id,
                 "group_col_id": group_col_id,
-                "treated_group": t_label,
-                "control_group": c_label,
+                "treated_group": str(t_label),
+                "control_group": str(c_label),
                 "method": method,
                 "baseline_diff": _safe_float(baseline_diff),
                 "adjusted_diff": _safe_float(adjusted_diff),
@@ -483,7 +494,7 @@ class StatAuditEngine:
         run_id: str,
         evidence_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        ledger = self._ledgers.get(run_id, {})
+        ledger = self._ledgers.get(validate_run_id(run_id), {})
         if evidence_id is not None:
             if evidence_id not in ledger:
                 raise SecurityError(f"Evidence ID '{evidence_id}' not found in run '{run_id}'")

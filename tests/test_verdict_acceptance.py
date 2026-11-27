@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, List, Tuple
 
 import pandas as pd
+import pytest
 
 from core.llm_router import LLMRouter
 from core.schema import (
@@ -414,11 +415,85 @@ def test_audit_cli_end_to_end_case_03(capsys: object) -> None:
             "--trace",
             "--budget",
             "1.0",
-            "--run-id",
-            "test_cli_case_03",
         ]
     )
     assert rc == 0
     captured = capsys.readouterr()  # type: ignore[attr-defined]
     assert "`CONTRADICTED`" in captured.out
     assert "Execution Trace" in captured.out
+
+
+def test_stdio_deduplicates_defaults_and_preserves_rejected_required_check(tmp_path: Path) -> None:
+    def review(claim, profile, _):
+        params = {"dataset_id": profile.dataset_id, "target_col_id": "col_04", "group_col_id": "col_02"}
+        requests = [
+            ToolRequest(tool_id="group_compare", parameters=params),
+            ToolRequest(tool_id="group_compare", parameters={**params, "metric": "mean", "stratify_col_id": None}),
+            ToolRequest(tool_id="get_evidence"),
+            ToolRequest(tool_id="inspect_data", parameters={"dataset_id": profile.dataset_id, "unexpected": 1}),
+        ]
+        issues = [IssueItem(issue_id=str(i), issue_type="metric", target_claim_id=claim.claim_id, requested_test=req)
+                  for i, req in enumerate(requests)]
+        out = BlindReviewOutput(claim_id=claim.claim_id, position=ReviewPosition.SUPPORT, issues=issues)
+        return out, out, False
+
+    runner = AuditWorkflowRunner(output_root=tmp_path, blind_review_fn=review)
+    args = {"raw_claim": "发券组订单高于未发券组", "data_path": FIXTURES_DIR / "case_01_valid_claim.csv"}
+    result = runner.run(**args, run_id="scoped_run")
+    events = [entry.get("event") for entry in result["trace"]]
+    assert events.count("tool_executed") == 1
+    assert events.count("cache_hit") == events.count("ledger_read") == events.count("tool_rejected_or_failed") == 1
+    assert result["state"].status == VerdictStatus.INSUFFICIENT
+    assert not result["state"].required_checks_complete
+    _assert_6_invariants(result["state"])
+    with pytest.raises(FileExistsError):
+        runner.run(**args, run_id="scoped_run")
+    with pytest.raises(ValueError, match="conflict fixture"):
+        runner.run(**args, initial_conflict_override={"decisive_refutation": True})
+
+
+def test_tool_cap_retains_unexecuted_required_check(tmp_path: Path) -> None:
+    runner = AuditWorkflowRunner(max_tool_calls=1, output_root=tmp_path)
+    result = runner.run(raw_claim="发券组订单高于未发券组",
+                        data_path=FIXTURES_DIR / "case_01_valid_claim.csv")
+    state = result["state"]
+    assert len(state.evidence) == 1
+    assert state.pending_tests and not state.required_checks_complete
+    assert state.status == VerdictStatus.INSUFFICIENT
+    _assert_6_invariants(state)
+
+
+def test_opposing_readings_escalate_once_and_accept_mechanically_grounded_mapping(tmp_path: Path) -> None:
+    def opposing(claim, profile, _):
+        req = ToolRequest(tool_id="group_compare", parameters={
+            "dataset_id": profile.dataset_id, "target_col_id": "col_04", "group_col_id": "col_02"})
+        issue = IssueItem(issue_id="comparison", issue_type="metric", target_claim_id=claim.claim_id,
+                          requested_test=req)
+        out = BlindReviewOutput(claim_id=claim.claim_id, position=ReviewPosition.SUPPORT, issues=[issue])
+        return out, out.model_copy(update={"position": ReviewPosition.OPPOSE}), False
+
+    def mapping(ctx, _):
+        candidate = next(c for c in ctx.candidate_interpretations if c["relation"] == "supports")
+        ids = candidate["cited_evidence_ids"]
+        return {"action": "propose_mapping_correction", "claim_id": ctx.claim_id,
+                "issue_id": ctx.unresolved_issue_id, "rule_id": candidate["rule_id"],
+                "candidate_id": candidate["candidate_id"], "evidence_ids": ids,
+                "reason_code": "positive_diff", "proposed_mapping": {eid: "supports" for eid in ids}}
+
+    runner = AuditWorkflowRunner(output_root=tmp_path, blind_review_fn=opposing, final_judge_fn=mapping,
+                                 final_judge_enabled=True)
+    state = runner.run(raw_claim="发券组订单高于未发券组",
+                       data_path=FIXTURES_DIR / "case_01_valid_claim.csv")["state"]
+    assert state.review_closed and state.judge_closed and state.judge_calls == 1
+    assert not state.unresolved_conflict and state.status == VerdictStatus.VERIFIED
+    assert next(iter(state.issues.values())).evidence_ids == list(state.evidence)
+    _assert_6_invariants(state)
+
+
+def test_case03_marginal_direction_survives_zero_within_strata(tmp_path: Path) -> None:
+    runner = AuditWorkflowRunner(output_root=tmp_path)
+    state = runner.run(raw_claim="发券组订单总体均值高于未发券组。",
+                       data_path=FIXTURES_DIR / "case_03_promo_confounding.csv")["state"]
+    stratified = next(ev.result for ev in state.evidence.values() if ev.result.get("strata"))
+    assert stratified["diff"] == 48 and all(row["diff"] == 0 for row in stratified["strata"])
+    assert state.status == VerdictStatus.VERIFIED

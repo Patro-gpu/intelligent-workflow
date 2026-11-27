@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from core.security import SecurityError
+from core.security import DatasetRegistry
 from skills.skill_2_stat_mcp.cli import main as cli_main
 from skills.skill_2_stat_mcp.engine import StatAuditEngine
 
@@ -104,3 +105,25 @@ def test_skill_2_cli_verify_runs_standalone(capsys: object) -> None:
     assert payload["tool_id"] == "group_compare"
     assert payload["result"]["diff"] == pytest.approx(48.0, abs=1e-6)
     assert all(s["diff"] == pytest.approx(0.0, abs=1e-6) for s in payload["result"]["strata"])
+
+
+def test_stratified_float_group_keys_and_median_inference(tmp_path: Path) -> None:
+    data = tmp_path / "float_groups.csv"
+    data.write_text("group,region,value\n1.0,A,16\n1.0,A,18\n0.0,A,12\n0.0,A,14\n,A,9\n", encoding="utf-8")
+    engine = StatAuditEngine(registry=DatasetRegistry([tmp_path]), output_root=tmp_path)
+    engine.register_dataset(data, "float_groups")
+    stats = engine.group_compare("float_groups", "col_03", "col_01", "median", "col_02").result
+    assert stats["strata"][0]["diff"] == stats["diff"] == 4
+    assert stats["p_value"] is None and stats["ci_95_low"] is None
+
+
+def test_reusing_another_engines_ledger_cannot_accept_or_append_evidence(tmp_path: Path) -> None:
+    owner = StatAuditEngine(output_root=tmp_path)
+    other = StatAuditEngine(output_root=tmp_path)
+    for engine in (owner, other):
+        engine.register_dataset(FIXTURES_DIR / "case_03_promo_confounding.csv", "case_03")
+    owner.inspect_data("case_03", run_id="shared")
+    with pytest.raises(FileExistsError):
+        other.inspect_data("case_03", run_id="shared")
+    assert other.get_evidence("shared") == []
+    assert len((tmp_path / "shared/evidence_ledger.jsonl").read_text(encoding="utf-8").splitlines()) == 1

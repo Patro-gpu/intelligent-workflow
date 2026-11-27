@@ -9,11 +9,16 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from core.llm_router import LLMRouter
+from pydantic import ValidationError
+
+from core.llm_router import LLMRouter, ModelCallError
+from core.security import resolve_safe_path
 from core.schema import (
     BlindReviewOutput,
     ClaimSpec,
@@ -52,7 +57,7 @@ _NUMBER_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*(%|％|单|万元|万|元|次|�
 
 def load_prompt_template(name: str) -> str:
     """加载 `configs/prompts/<name>.md` 外置提示词模板。"""
-    path = PROMPTS_DIR / f"{name}.md"
+    path = resolve_safe_path(PROMPTS_DIR / f"{name}.md", [PROMPTS_DIR])
     if not path.exists():
         raise FileNotFoundError(f"Prompt template not found: {path}")
     return path.read_text(encoding="utf-8")
@@ -131,13 +136,19 @@ def freeze_claim(
                 {"role": "system", "content": prompt},
                 {
                     "role": "user",
-                    "content": f"claim_id={claim_id}\nraw_text={cleaned}\ncontext_notes={context_notes}",
+                    "content": json.dumps({"claim_id": claim_id, "raw_text": cleaned, "context_notes": context_notes}, ensure_ascii=False),
                 },
             ],
             expect_json=True,
         )
-        if resp.parsed_json:
-            return ClaimSpec.model_validate(resp.parsed_json)
+        try:
+            parsed = ClaimSpec.model_validate(resp.parsed_json)
+        except ValidationError:
+            raise ModelCallError("Model returned an invalid ClaimSpec") from None
+        if parsed.claim_id != claim_id or parsed.raw_text != cleaned:
+            raise ModelCallError("Claim parser changed the supplied claim identity or text")
+        return parsed.model_copy(update={"context_notes": context_notes, "scope_id": scope_id,
+                                         "time_window": time_window, "metric": metric or parsed.metric})
 
     target_value, unit = _extract_numeric_target(cleaned)
     direction = _infer_direction(cleaned)
@@ -430,47 +441,61 @@ def _build_mock_challenger_review(claim: ClaimSpec, profile: DatasetProfile) -> 
     )
 
 
+def run_reviewer(
+    role: str, claim: ClaimSpec, profile: DatasetProfile, router: LLMRouter,
+) -> BlindReviewOutput:
+    """Run one independent review using only the frozen claim and safe profile."""
+    builders = {"primary_reviewer": _build_mock_primary_review, "challenger": _build_mock_challenger_review}
+    if role not in builders:
+        raise ValueError("Unsupported reviewer")
+    # Never send arbitrary source headings to a model. Preserve recognized metric semantics
+    # for the benchmark and use registered IDs plus type/role hints for other columns.
+    known_labels = {"has_coupon", "orders", "is_promo", "base_revenue_wan", "current_revenue_wan",
+                    "merchant_id", "region", "subgroup"}
+    safe_profile = profile.model_dump(mode="json")
+    for col in safe_profile["columns"]:
+        if col["sanitized_name"] not in known_labels:
+            col["sanitized_name"] = col["col_id"]
+    response = router.complete(
+        role=role,
+        messages=[
+            {"role": "system", "content": load_prompt_template(role)},
+            {"role": "user", "content": json.dumps(
+                {"round": 1, "ClaimSpec": claim.model_dump(mode="json"), "DatasetProfile": safe_profile},
+                ensure_ascii=False,
+            )},
+        ],
+        max_tokens=1536,
+        mock_payload=builders[role](claim, profile).model_dump(mode="json") if router.mock_mode else None,
+    )
+    try:
+        review = BlindReviewOutput.model_validate(response.parsed_json)
+    except ValidationError:
+        raise ModelCallError(f"Model returned an invalid BlindReviewOutput for {role}") from None
+    claim_ids = {claim.claim_id, *(sub.sub_claim_id for sub in claim.sub_claims)}
+    if review.claim_id != claim.claim_id or any(
+        issue.target_claim_id not in claim_ids or issue.evidence_ids
+        or issue.status not in (IssueStatus.OPEN, IssueStatus.UNRESOLVABLE)
+        for issue in review.issues
+    ):
+        raise ModelCallError("Blind review supplied an unbound claim, evidence or disposition")
+    return review
+
+
 def run_blind_review(
     claim_spec: ClaimSpec,
     dataset_profile: DatasetProfile,
     *,
     router: Optional[LLMRouter] = None,
 ) -> Tuple[BlindReviewOutput, BlindReviewOutput, bool]:
-    """第 1 轮并行盲审：初审与反方彼此隔离，返回 `(primary_out, challenger_out, model_diversity_lost)`。"""
+    """Run the two isolated reviewers with a shared, atomically reserved budget."""
     active_router = router or LLMRouter(mock_mode=True)
-    primary_prompt = load_prompt_template("primary_reviewer")
-    challenger_prompt = load_prompt_template("challenger")
-
-    shared_input = (
-        f"ClaimSpec: {claim_spec.model_dump_json()}\n"
-        f"DatasetProfile: {dataset_profile.model_dump_json()}"
-    )
-
-    mock_primary = _build_mock_primary_review(claim_spec, dataset_profile).model_dump(mode="json")
-    mock_challenger = _build_mock_challenger_review(claim_spec, dataset_profile).model_dump(mode="json")
-
-    p_resp = active_router.complete(
-        role="primary_reviewer",
-        messages=[
-            {"role": "system", "content": primary_prompt},
-            {"role": "user", "content": shared_input},
-        ],
-        expect_json=True,
-        mock_payload=mock_primary if active_router.mock_mode else None,
-    )
-    c_resp = active_router.complete(
-        role="challenger",
-        messages=[
-            {"role": "system", "content": challenger_prompt},
-            {"role": "user", "content": shared_input},
-        ],
-        expect_json=True,
-        mock_payload=mock_challenger if active_router.mock_mode else None,
-    )
-
-    primary_out = BlindReviewOutput.model_validate(p_resp.parsed_json or mock_primary)
-    challenger_out = BlindReviewOutput.model_validate(c_resp.parsed_json or mock_challenger)
-    return primary_out, challenger_out, active_router.model_diversity_lost
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        primary, challenger = [
+            pool.submit(run_reviewer, role, claim_spec, dataset_profile, active_router)
+            for role in ("primary_reviewer", "challenger")
+        ]
+        return primary.result(), challenger.result(), active_router.model_diversity_lost
 
 
 def deduplicate_and_plan_tasks(

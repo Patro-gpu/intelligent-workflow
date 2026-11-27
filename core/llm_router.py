@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
+from threading import Lock
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -15,12 +17,17 @@ from pydantic import Field
 import yaml
 
 from core.schema import StrictModel
+from core.security import resolve_safe_path, sandbox_root
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class BudgetExceededError(RuntimeError):
     """预算硬上限熔断异常。"""
+
+
+class ModelCallError(RuntimeError):
+    """A provider failed or returned an unusable payload; messages omit provider content."""
 
 
 class LLMResponse(StrictModel):
@@ -45,6 +52,14 @@ _PROVIDER_ENV_PREFIX: Dict[str, str] = {
     "premium": "PREMIUM",
 }
 
+_DEFAULT_BASE_URLS = {
+    "deepseek": "https://api.deepseek.com/v1",
+    "doubao": "https://ark.cn-beijing.volces.com/api/v3",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "premium": "https://api.openai.com/v1",
+}
+
+
 _DEFAULT_MODELS: Dict[str, str] = {
     "deepseek": "deepseek-chat",
     "doubao": "doubao-1-5-pro-32k-250115",
@@ -59,7 +74,7 @@ class LLMRouter:
     def __init__(
         self,
         config_path: str | Path = REPO_ROOT / "configs/models.yaml",
-        log_dir: str | Path = REPO_ROOT / "workspace/logs",
+        log_dir: str | Path = REPO_ROOT / "workspace/outputs/logs",
         mock_mode: Optional[bool] = None,
         max_budget_cny: Optional[float] = None,
         timeout_seconds: float = 30.0,
@@ -89,9 +104,18 @@ class LLMRouter:
         else:
             self.max_budget_cny = float(max_budget_cny)
 
+        if not math.isfinite(self.max_budget_cny) or self.max_budget_cny < 0:
+            raise ValueError("Budget must be finite and non-negative")
+        if any(not math.isfinite(float(rate)) or float(rate) < 0
+               for rates in self.pricing_cfg.values() for rate in rates.values()):
+            raise ValueError("Pricing must be finite and non-negative")
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        self._lock = Lock()
+        self._reserved_cny = 0.0
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
-        self.log_dir = Path(log_dir)
+        self.log_dir = sandbox_root(log_dir)
         self.simulate_primary_failure_roles: Set[str] = set(simulate_primary_failure_roles or set())
 
         self.spent_cny: float = 0.0
@@ -100,7 +124,7 @@ class LLMRouter:
 
     @property
     def remaining_budget_cny(self) -> float:
-        return max(0.0, self.max_budget_cny - self.spent_cny)
+        return max(0.0, self.max_budget_cny - self.spent_cny - self._reserved_cny)
 
     @property
     def model_diversity_lost(self) -> bool:
@@ -128,8 +152,10 @@ class LLMRouter:
         max_tokens: int = 512,
     ) -> float:
         """保守预估本次请求成本用于调用前预算熔断。"""
-        approx_chars = sum(len(m.get("content", "")) for m in messages)
-        est_prompt_tokens = max(64, approx_chars // 3 + 32)
+        # Byte-token upper estimate for the supplied messages, including chat framing.
+        est_prompt_tokens = 64 + sum(
+            32 + sum(len(str(v).encode("utf-8")) for v in m.values()) for m in messages
+        )
         return self.estimate_cost_cny(provider, est_prompt_tokens, max_tokens)
 
     def _resolve_role_providers(self, role: str, provider_override: Optional[str] = None) -> Tuple[str, Optional[str]]:
@@ -147,10 +173,10 @@ class LLMRouter:
         api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
         base_url = os.getenv(f"{prefix}_BASE_URL", "").strip()
         model = os.getenv(f"{prefix}_MODEL", _DEFAULT_MODELS[provider]).strip()
-        return api_key, base_url, model
+        return api_key, base_url or _DEFAULT_BASE_URLS[provider], model
 
     def _check_budget_or_raise(self, reserved_cost: float, role: str, provider: str) -> None:
-        if self.spent_cny + reserved_cost > self.max_budget_cny + 1e-12:
+        if not math.isfinite(self.max_budget_cny) or reserved_cost > self.remaining_budget_cny + 1e-12:
             self._append_audit_log(
                 role=role,
                 requested_provider=provider,
@@ -165,8 +191,18 @@ class LLMRouter:
             )
             raise BudgetExceededError(
                 f"Budget exceeded for role='{role}' provider='{provider}': "
-                f"spent={self.spent_cny:.6f} + reserved={reserved_cost:.6f} > max={self.max_budget_cny:.6f}"
+                f"remaining={self.remaining_budget_cny:.6f}, request_reservation={reserved_cost:.6f}"
             )
+
+    def check_live_configuration(self, roles: List[str]) -> None:
+        for role in roles:
+            providers = self._resolve_role_providers(role)
+            if not any(self._has_credentials(p) for p in providers if p):
+                raise ModelCallError(f"No configured API key for role '{role}' (check .env)")
+
+    def _has_credentials(self, provider: str) -> bool:
+        key, _, _ = self._get_provider_credentials(provider)
+        return bool(key and not key.lower().startswith("your_"))
 
     def _mock_completion(
         self,
@@ -198,38 +234,25 @@ class LLMRouter:
         expect_json: bool,
         max_tokens: int,
         temperature: float,
-    ) -> Tuple[str, Optional[Dict[str, Any]], int, int, str]:
+    ) -> Tuple[str, Optional[Dict[str, Any]], Optional[int], Optional[int], str]:
         api_key, base_url, model = self._get_provider_credentials(provider)
-        if not api_key or api_key.lower().startswith("your_"):
-            raise RuntimeError(f"Missing real API key for provider '{provider}'")
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url or None,
-            timeout=self.timeout_seconds,
-        )
         kwargs: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            "model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
         }
         if expect_json:
             kwargs["response_format"] = {"type": "json_object"}
-
-        last_exc: Optional[Exception] = None
-        for _ in range(self.max_retries + 1):
-            try:
-                resp = client.chat.completions.create(**kwargs)
-                content = resp.choices[0].message.content or ""
-                usage = getattr(resp, "usage", None)
-                prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-                completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-                parsed_json = json.loads(content) if expect_json else None
-                return content, parsed_json, prompt_tokens, completion_tokens, model
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-        raise RuntimeError(f"Live call failed for provider '{provider}': {last_exc}") from last_exc
+        # Every wire attempt must pass our own budget reservation.
+        with OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout_seconds, max_retries=0) as client:
+            resp = client.chat.completions.create(**kwargs)
+        content = resp.choices[0].message.content or ""
+        parsed = json.loads(content) if expect_json else None
+        if expect_json and not isinstance(parsed, dict):
+            raise ValueError("Expected one JSON object")
+        # Missing usage means the request may have consumed the full reservation.
+        usage = resp.usage
+        p_tok = getattr(usage, "prompt_tokens", None)
+        c_tok = getattr(usage, "completion_tokens", None)
+        return content, parsed, p_tok, c_tok, model
 
     def _append_audit_log(
         self,
@@ -245,10 +268,10 @@ class LLMRouter:
         latency_ms: float,
         status: str,
     ) -> None:
-        """向 `workspace/logs/audit_YYYYMMDD.jsonl` 写入脱敏审计日志（严禁密钥或原始数据行）。"""
+        """向 `workspace/outputs/logs/audit_YYYYMMDD.jsonl` 写入脱敏审计日志（严禁密钥或原始数据行）。"""
         self.log_dir.mkdir(parents=True, exist_ok=True)
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        log_file = self.log_dir / f"audit_{today}.jsonl"
+        log_file = resolve_safe_path(self.log_dir / f"audit_{today}.jsonl", [self.log_dir])
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "role": role,
@@ -280,91 +303,65 @@ class LLMRouter:
     ) -> LLMResponse:
         """按角色执行模型调用：预算预检 -> 主力调用 -> 失败自动降级 Qwen -> 脱敏审计日志。"""
         primary_provider, fallback_provider = self._resolve_role_providers(role, provider_override)
-        reserved_cost = self.estimate_reserved_cost_cny(primary_provider, messages, max_tokens=max_tokens)
-        self._check_budget_or_raise(reserved_cost, role=role, provider=primary_provider)
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
 
-        start_ts = time.perf_counter()
-        used_provider = primary_provider
-        used_fallback = False
+        providers = [primary_provider] if role == "final_reviewer" else [primary_provider, fallback_provider]
+        for provider in dict.fromkeys(providers):
+            if not provider or (not self.mock_mode and not self._has_credentials(provider)):
+                continue
+            attempts = 1 if self.mock_mode or role == "final_reviewer" else 1 + self.max_retries
+            for _ in range(attempts):
+                reserved = self.estimate_reserved_cost_cny(provider, messages, max_tokens)
+                with self._lock:
+                    self._check_budget_or_raise(reserved, role, provider)
+                    self._reserved_cny += reserved
 
-        try:
-            if self.mock_mode:
-                if role in self.simulate_primary_failure_roles:
-                    raise RuntimeError(f"Simulated primary failure for role='{role}'")
-                _, _, model = self._get_provider_credentials(primary_provider)
-                content, parsed_json, p_tok, c_tok = self._mock_completion(
-                    role=role,
-                    provider=primary_provider,
-                    messages=messages,
-                    expect_json=expect_json,
-                    mock_payload=mock_payload,
+                started = time.perf_counter()
+                cost = reserved
+                status = "failed_reserved"
+                p_tok = c_tok = None
+                model = self._get_provider_credentials(provider)[2]
+                try:
+                    if self.mock_mode:
+                        if provider == primary_provider and role in self.simulate_primary_failure_roles:
+                            cost = 0.0
+                            raise ModelCallError("Simulated failure")
+                        content, parsed, p_tok, c_tok = self._mock_completion(
+                            role, provider, messages, expect_json, mock_payload
+                        )
+                        c_tok = min(c_tok, max_tokens)
+                    else:
+                        content, parsed, p_tok, c_tok, model = self._live_completion(
+                            provider, messages, expect_json, max_tokens, temperature
+                        )
+                    if p_tok is not None and c_tok is not None and min(p_tok, c_tok) >= 0:
+                        cost = self.estimate_cost_cny(provider, p_tok, c_tok)
+                        status = "ok"
+                    else:
+                        status = "ok_reserved"
+                except Exception:
+                    # Never expose raw provider errors, which may include URLs, keys or prompt fragments.
+                    continue
+                finally:
+                    latency = (time.perf_counter() - started) * 1000
+                    with self._lock:
+                        self._reserved_cny = round(self._reserved_cny - reserved, 8)
+                        self.spent_cny = round(self.spent_cny + cost, 8)
+                        self.call_count += 1
+                        if status.startswith("ok"):
+                            self.role_providers_used[role] = provider
+                        self._append_audit_log(
+                            role=role, requested_provider=primary_provider, used_provider=provider,
+                            model=model, used_fallback=provider != primary_provider,
+                            prompt_tokens=p_tok or 0, completion_tokens=c_tok or 0, cost_cny=cost,
+                            latency_ms=latency, status=status,
+                        )
+                return LLMResponse(
+                    role=role, requested_provider=primary_provider, used_provider=provider, model=model,
+                    content=content, parsed_json=parsed, used_fallback=provider != primary_provider,
+                    mock_mode=self.mock_mode, prompt_tokens=p_tok or 0, completion_tokens=c_tok or 0,
+                    cost_cny=cost, latency_ms=round(latency, 2),
                 )
-            else:
-                content, parsed_json, p_tok, c_tok, model = self._live_completion(
-                    provider=primary_provider,
-                    messages=messages,
-                    expect_json=expect_json,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-        except Exception:
-            if not fallback_provider:
-                raise
-            used_provider = fallback_provider
-            used_fallback = True
-            fallback_reserved = self.estimate_reserved_cost_cny(
-                fallback_provider, messages, max_tokens=max_tokens
-            )
-            self._check_budget_or_raise(fallback_reserved, role=role, provider=fallback_provider)
 
-            if self.mock_mode:
-                _, _, model = self._get_provider_credentials(fallback_provider)
-                content, parsed_json, p_tok, c_tok = self._mock_completion(
-                    role=role,
-                    provider=fallback_provider,
-                    messages=messages,
-                    expect_json=expect_json,
-                    mock_payload=mock_payload,
-                )
-            else:
-                content, parsed_json, p_tok, c_tok, model = self._live_completion(
-                    provider=fallback_provider,
-                    messages=messages,
-                    expect_json=expect_json,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-
-        latency_ms = (time.perf_counter() - start_ts) * 1000.0
-        cost_cny = self.estimate_cost_cny(used_provider, p_tok, c_tok)
-        self.spent_cny = round(self.spent_cny + cost_cny, 8)
-        self.call_count += 1
-        self.role_providers_used[role] = used_provider
-
-        self._append_audit_log(
-            role=role,
-            requested_provider=primary_provider,
-            used_provider=used_provider,
-            model=model,
-            used_fallback=used_fallback,
-            prompt_tokens=p_tok,
-            completion_tokens=c_tok,
-            cost_cny=cost_cny,
-            latency_ms=latency_ms,
-            status="ok",
-        )
-
-        return LLMResponse(
-            role=role,
-            requested_provider=primary_provider,
-            used_provider=used_provider,
-            model=model,
-            content=content,
-            parsed_json=parsed_json,
-            used_fallback=used_fallback,
-            mock_mode=self.mock_mode,
-            prompt_tokens=p_tok,
-            completion_tokens=c_tok,
-            cost_cny=cost_cny,
-            latency_ms=round(latency_ms, 2),
-        )
+        raise ModelCallError(f"No usable model response for role '{role}' (check provider settings and audit log)")

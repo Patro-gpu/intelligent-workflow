@@ -20,6 +20,7 @@ from core.schema import (
     ClaimSpec,
     ClaimType,
     EvidenceRecord,
+    DatasetProfile,
     FinalJudgeOutput,
     FinalJudgeOutputAdapter,
     IssueStatus,
@@ -80,16 +81,53 @@ def _direction_matches(value: float, direction: Optional[str]) -> bool:
     return True
 
 
-def _is_causal_claim(claim_spec: ClaimSpec) -> bool:
-    if claim_spec.claim_type == ClaimType.CAUSAL:
-        return True
-    return any(sc.required and sc.claim_type == ClaimType.CAUSAL for sc in claim_spec.sub_claims)
+def _admissible_records(state: WorkflowState) -> List[EvidenceRecord]:
+    return [
+        ev for eid, ev in state.evidence.items()
+        if eid == ev.evidence_id and ev.claim_id == state.claim_id
+        and ev.dataset_hash == state.dataset_hash and ev.execution_status == "ok" and ev.applicable
+        and ev.tool_id in {"group_compare", "aggregate", "sensitivity_check", "inspect_data"}
+    ]
 
 
-def _is_universal_claim(claim_spec: ClaimSpec) -> bool:
-    if claim_spec.claim_type == ClaimType.UNIVERSAL:
-        return True
-    return any(sc.required and sc.claim_type == ClaimType.UNIVERSAL for sc in claim_spec.sub_claims)
+def _growth_rate(profile: Optional[DatasetProfile], records: List[EvidenceRecord]) -> Optional[float]:
+    """Match the named base/current revenue columns, regardless of column or request order."""
+    if profile is None:
+        return None
+    names = {c.col_id: c.sanitized_name for c in profile.columns}
+    sums = {
+        names.get(ev.result.get("target_col_id")): ev.result["value"]
+        for ev in records if ev.tool_id == "aggregate" and ev.scope_id == "global"
+        and ev.result.get("metric") == "sum" and ev.result.get("value") is not None
+    }
+    base, current = sums.get("base_revenue_wan"), sums.get("current_revenue_wan")
+    if base is None or base == 0 or current is None:
+        return None
+    return (current - base) / base * 100
+
+
+def _matches_group_estimand(claim: ClaimSpec, ev: EvidenceRecord, profile: DatasetProfile) -> bool:
+    """Bind a model-selected comparison to the frozen column, statistic and treatment group."""
+    data = ev.result
+    cols = {c.col_id: c for c in profile.columns}
+    target = cols.get(data.get("target_col_id"))
+    group_id = data.get("group_col_id")
+    if target is None or target.col_id == group_id or group_id not in profile.candidate_group_cols:
+        return False
+    metric = data.get("metric", "mean")
+    metric_keys = {target.col_id, target.sanitized_name,
+                   f"{target.sanitized_name}_{metric}_diff", f"{target.col_id}_{metric}_diff"}
+    if claim.metric not in metric_keys or claim.scope_id != "global" or claim.time_window:
+        return False
+    preferred = [c.col_id for c in cols.values() if c.col_id in profile.candidate_group_cols
+                 and c.sanitized_name in {"has_coupon", "treatment", "treated", "group"}]
+    if (preferred or profile.candidate_group_cols) != [group_id]:
+        return False
+    if "stratify_col_id" in data:
+        strat = data["stratify_col_id"]
+        if strat in (group_id, target.col_id) or strat not in profile.candidate_group_cols:
+            return False
+    return True
 
 
 def evaluate_evidence_rules(
@@ -99,6 +137,7 @@ def evaluate_evidence_rules(
     warning_threshold: float = 0.20,
     severe_threshold: float = 0.50,
     significance_alpha: float = 0.05,
+    profile: Optional[DatasetProfile] = None,
     magnitude_rel_tol: float = 0.15,
 ) -> WorkflowState:
     """基于账本中有效 `EvidenceRecord` 与 `IssueItem` 确定性更新 `WorkflowState` 布尔位。
@@ -106,11 +145,15 @@ def evaluate_evidence_rules(
     不直接修改输入对象，返回更新后的新 `WorkflowState` 副本。
     """
     next_state = state.model_copy(deep=True)
-    admissible: List[EvidenceRecord] = [
-        ev
-        for ev in next_state.evidence.values()
-        if ev.execution_status == "ok" and ev.applicable
-    ]
+    if claim_spec.claim_id != state.claim_id:
+        raise ValueError("Claim does not match workflow state")
+    admissible = _admissible_records(next_state)
+    next_state.decisive_refutation = False
+    next_state.full_claim_supported = False
+    next_state.core_supported = False
+    next_state.material_limitation = False
+    if len(admissible) != len(next_state.evidence):
+        next_state.critical_gap = True
 
     # 检查是否存在不可补齐的关键数据/因果缺口
     has_unresolvable_gap = any(
@@ -129,10 +172,19 @@ def evaluate_evidence_rules(
     magnitude_supported = True
     decisive_refutation = next_state.decisive_refutation
     material_limitation = next_state.material_limitation
-    has_causal_control_evidence = False
+    subgroup_coverage = False
+    percent_growth = claim_spec.metric.endswith("growth_rate") or claim_spec.unit == "percent"
+    growth = _growth_rate(profile, admissible) if percent_growth else None
+    known_columns = {c.col_id: c.sanitized_name for c in profile.columns} if profile else {}
+    requires_strata = claim_spec.claim_type in (ClaimType.CAUSAL, ClaimType.UNIVERSAL)
 
     for ev in admissible:
         res = ev.result
+
+        if profile and ev.tool_id in {"group_compare", "sensitivity_check"}:
+            if percent_growth or not _matches_group_estimand(claim_spec, ev, profile):
+                next_state.critical_gap = True
+                continue
 
         # 1. 分组比较 / 分层混淆 / 子组反例检验
         if ev.tool_id == "group_compare":
@@ -140,31 +192,40 @@ def evaluate_evidence_rules(
             p_value = res.get("p_value")
             strata = res.get("strata")
 
-            if strata and isinstance(strata, list):
-                has_causal_control_evidence = True
+            if requires_strata and "stratify_col_id" in res and not strata:
+                next_state.critical_gap = True
+                continue
+            if requires_strata and strata and isinstance(strata, list):
                 strata_diffs = [
                     float(s["diff"])
                     for s in strata
                     if isinstance(s, dict) and s.get("diff") is not None
                 ]
+                subgroup_coverage = len(strata_diffs) == len(strata)
+                if not subgroup_coverage:
+                    next_state.critical_gap = True
                 if strata_diffs:
                     # 全称命题存在可靠负向子组反例 -> 决定性反证
-                    if _is_universal_claim(claim_spec) and any(
+                    if claim_spec.claim_type == ClaimType.UNIVERSAL and any(
                         not _direction_matches(d, claim_spec.direction) for d in strata_diffs
                     ):
                         decisive_refutation = True
 
-                    # 辛普森悖论：所有分层差值均归零或反向，推翻原始正向/幅度/因果声明
+                    # 分层归零或反向针对因果/全称声明。总体方向另由 raw_diff 核验。
                     all_collapsed = all(abs(d) <= 1e-6 for d in strata_diffs)
                     all_reversed = all(
                         not _direction_matches(d, claim_spec.direction) for d in strata_diffs
                     )
-                    if (all_collapsed or all_reversed) and claim_spec.direction in ("increase", "decrease"):
+                    if subgroup_coverage and (all_collapsed or all_reversed) and claim_spec.direction in ("increase", "decrease"):
                         decisive_refutation = True
-            elif raw_diff is not None:
+            if raw_diff is None:
+                next_state.critical_gap = True
+            else:
                 diff_val = float(raw_diff)
                 dir_ok = _direction_matches(diff_val, claim_spec.direction)
                 sig_ok = p_value is None or float(p_value) <= significance_alpha
+                if claim_spec.direction not in ("increase", "decrease") and claim_spec.target_value is None:
+                    continue
                 if dir_ok and sig_ok:
                     core_supported = True
                 elif not dir_ok:
@@ -183,9 +244,21 @@ def evaluate_evidence_rules(
 
         # 2. 聚合口径与分母增长率检验
         elif ev.tool_id == "aggregate":
-            observed = res.get("growth_rate_pct")
-            if observed is None:
+            if ev.scope_id != claim_spec.scope_id or claim_spec.time_window:
+                continue
+            if percent_growth:
+                observed = res.get("growth_rate_pct")
+                if observed is None and claim_spec.metric in {"growth_rate", "revenue_growth_rate"}:
+                    observed = growth
+            elif claim_spec.claim_type in (ClaimType.DESCRIPTIVE, ClaimType.MAGNITUDE) and not claim_spec.metric.endswith("_diff"):
+                col_id = res.get("target_col_id")
+                if profile and claim_spec.metric not in {
+                    f"{col_id}_{res.get('metric')}", f"{known_columns.get(col_id)}_{res.get('metric')}",
+                }:
+                    continue
                 observed = res.get("value")
+            else:
+                continue
             if observed is not None and claim_spec.target_value is not None:
                 obs_val = float(observed)
                 target = float(claim_spec.target_value)
@@ -202,7 +275,9 @@ def evaluate_evidence_rules(
         elif ev.tool_id == "sensitivity_check":
             baseline = res.get("baseline_diff")
             adjusted = res.get("adjusted_diff")
-            if baseline is not None and adjusted is not None:
+            if baseline is None or adjusted is None:
+                next_state.critical_gap = True
+            else:
                 rob = assess_robustness(
                     float(baseline),
                     float(adjusted),
@@ -221,10 +296,11 @@ def evaluate_evidence_rules(
                         magnitude_supported = False
 
     # 复合命题合取保护：因果命题若缺少因果识别/分层控制证据，不可将方向通过误判为整体 verified
-    if _is_causal_claim(claim_spec) and not has_causal_control_evidence and not decisive_refutation:
+    # Stratified association can refute a causal claim, but cannot establish identification.
+    if claim_spec.claim_type == ClaimType.CAUSAL or (claim_spec.claim_type == ClaimType.UNIVERSAL and not subgroup_coverage):
         next_state.critical_gap = True
 
-    next_state.required_checks_complete = True
+    next_state.required_checks_complete = not next_state.pending_tests and not next_state.critical_gap
     next_state.core_supported = core_supported
     next_state.decisive_refutation = decisive_refutation
     next_state.material_limitation = material_limitation
@@ -235,6 +311,31 @@ def evaluate_evidence_rules(
         and not material_limitation
         and not next_state.critical_gap
     )
+    for sub in claim_spec.sub_claims:
+        if not sub.required:
+            continue
+        if (sub.scope_id != claim_spec.scope_id or sub.metric != claim_spec.metric) and profile is None:
+            # A standalone bundle without a column profile cannot re-bind parent receipts to a new estimand.
+            next_state.critical_gap = True
+            next_state.required_checks_complete = next_state.full_claim_supported = False
+            continue
+        sub_claim = claim_spec.model_copy(update={
+            **sub.model_dump(exclude={"sub_claim_id", "required"}), "sub_claims": [],
+        })
+        evaluated = evaluate_evidence_rules(
+            sub_claim, state, profile=profile, warning_threshold=warning_threshold,
+            severe_threshold=severe_threshold, significance_alpha=significance_alpha,
+            magnitude_rel_tol=magnitude_rel_tol,
+        )
+        sub_status = classify(evaluated)
+        if sub_status == VerdictStatus.CONTRADICTED:
+            next_state.decisive_refutation = True
+        elif sub_status == VerdictStatus.INSUFFICIENT:
+            next_state.critical_gap = True
+            next_state.required_checks_complete = False
+        elif sub_status == VerdictStatus.LIMITED:
+            next_state.material_limitation = True
+        next_state.full_claim_supported &= sub_status == VerdictStatus.VERIFIED
     return next_state
 
 
@@ -295,11 +396,9 @@ def validate_judge_output(
         return False, None, reasons
 
     if parsed.claim_id != context.claim_id:
-        reasons.append(f"claim_id mismatch: got '{parsed.claim_id}', expected '{context.claim_id}'")
+        reasons.append("claim_id mismatch")
     if parsed.issue_id != context.unresolved_issue_id:
-        reasons.append(
-            f"issue_id mismatch: got '{parsed.issue_id}', expected '{context.unresolved_issue_id}'"
-        )
+        reasons.append("issue_id mismatch")
 
     admissible_ids: Set[str] = {
         ev.evidence_id
@@ -313,16 +412,33 @@ def validate_judge_output(
     }
 
     if isinstance(parsed, JudgeMappingCorrection):
-        if valid_candidate_ids and parsed.candidate_id not in valid_candidate_ids:
-            reasons.append(f"Unknown candidate_id: '{parsed.candidate_id}'")
+        if parsed.candidate_id not in valid_candidate_ids:
+            reasons.append("Unknown candidate_id")
         if not parsed.evidence_ids:
             reasons.append("Mapping correction must cite at least one admissible evidence_id")
         unknown_ev = [eid for eid in parsed.evidence_ids if eid not in admissible_ids]
         if unknown_ev:
-            reasons.append(f"Cited non-existent or inadmissible evidence_ids: {unknown_ev}")
-        forbidden_in_map = [k for k in parsed.proposed_mapping if k in _FORBIDDEN_MAPPING_KEYS]
-        if forbidden_in_map:
-            reasons.append(f"proposed_mapping contains forbidden override keys: {forbidden_in_map}")
+            reasons.append("Cited non-existent or inadmissible evidence_ids")
+        # A mapping must match a single explicit candidate relation for *each* cited record.
+        candidate = next((c for c in context.candidate_interpretations
+                          if c.get("candidate_id") == parsed.candidate_id), {})
+        relation = candidate.get("relation")
+        if (relation not in ("supports", "limits", "contradicts")
+                or candidate.get("rule_id") != parsed.rule_id or parsed.unresolved_issue_ids
+                or set(parsed.proposed_mapping) != set(parsed.evidence_ids)
+                or set(parsed.evidence_ids) != set(candidate.get("cited_evidence_ids", []))):
+            reasons.append("Mapping is outside the frozen candidate or rule")
+        claim = context.claim_spec
+        for ev in context.admissible_evidence:
+            if ev.evidence_id not in parsed.evidence_ids:
+                continue
+            single = WorkflowState(run_id="check", claim_id=claim.claim_id, dataset_hash=ev.dataset_hash,
+                                   evidence={ev.evidence_id: ev})
+            flags = evaluate_evidence_rules(claim, single)
+            actual = ("contradicts" if flags.decisive_refutation else "limits" if flags.material_limitation
+                      else "supports" if flags.core_supported else None)
+            if actual is None or actual != relation or parsed.proposed_mapping.get(ev.evidence_id) != actual:
+                reasons.append("Mapping cannot be verified from cited evidence")
 
     if reasons:
         return False, None, reasons
@@ -339,9 +455,7 @@ def build_audit_verdict(
     status = classify(state)
     invariants_ok, violations = check_invariants(state)
 
-    admissible_evs = [
-        ev for ev in state.evidence.values() if ev.execution_status == "ok" and ev.applicable
-    ]
+    admissible_evs = _admissible_records(state)
     cited_ids = sorted(ev.evidence_id for ev in admissible_evs)
 
     key_findings: List[str] = []
