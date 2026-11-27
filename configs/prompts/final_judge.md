@@ -19,7 +19,7 @@
      "rule_id": "string",
      "evidence_ids": ["ev_001"],
      "reason_code": "string",
-     "proposed_mapping": {},
+     "proposed_mapping": {"ev_001": "supports"},
      "unresolved_issue_ids": []
    }
    ```
@@ -33,3 +33,7 @@
      "unresolved_issue_ids": ["issue_id"]
    }
    ```
+
+每次只返回一个 JSON 对象，无代码围栏与说明。复制本次输入的 claim_id 和 unresolved_issue_id（输出键为 issue_id）。仅可引用本次输入实际出现的标识符。证据不足时使用 report_unresolved。
+
+提交映射修正时，rule_id 必须取自所选候选项。evidence_ids 必须与该候选项的 cited_evidence_ids 完全对应。proposed_mapping 的每个键都是上述证据 ID，每个值等于候选项提供的 relation。未提供这些字段或关系不能核验时使用 report_unresolved。修正时 unresolved_issue_ids 为空。

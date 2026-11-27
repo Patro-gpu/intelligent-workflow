@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -18,8 +20,9 @@ import streamlit as st  # noqa: E402
 
 from core.llm_router import LLMRouter  # noqa: E402
 from core.schema import BlindReviewOutput, ClaimSpec, ReviewPosition  # noqa: E402
-from skills.skill_2_stat_mcp.engine import StatAuditEngine  # noqa: E402
-from skills.skill_3_claim_planner.skill import _build_mock_primary_review, freeze_claim  # noqa: E402
+from core.security import SecurityError, sandbox_root  # noqa: E402
+from skills.skill_1_data_profiler.skill import load_sandbox_config  # noqa: E402
+from skills.skill_3_claim_planner.skill import freeze_claim, run_reviewer  # noqa: E402
 from skills.skill_4_evidence_auditor.skill import check_invariants  # noqa: E402
 from workflows.state_machine import AuditWorkflowRunner  # noqa: E402
 
@@ -49,23 +52,35 @@ def _run_r2_vs_r5(csv_path: Path, raw_claim: str, context_notes: str, budget: fl
     claim_spec = freeze_claim(raw_claim, claim_id="ui_claim", context_notes=context_notes)
 
     r2_router = LLMRouter(mock_mode=True, max_budget_cny=budget)
-    r2_engine = StatAuditEngine()
 
-    def _single_only(c: ClaimSpec, prof, _):
-        return _build_mock_primary_review(c, prof), BlindReviewOutput(
+    def _single_only(c: ClaimSpec, prof, router):
+        return run_reviewer("primary_reviewer", c, prof, router), BlindReviewOutput(
             claim_id=c.claim_id, position=ReviewPosition.UNCERTAIN, issues=[]
         ), False
 
     r2_res = AuditWorkflowRunner(
-        router=r2_router, stat_engine=r2_engine, blind_review_fn=_single_only
+        router=r2_router, blind_review_fn=_single_only
     ).run(data_path=csv_path, raw_claim=raw_claim, claim_spec=claim_spec, persist_outputs=False)
 
     r5_router = LLMRouter(mock_mode=True, max_budget_cny=budget)
-    r5_engine = StatAuditEngine()
-    r5_res = AuditWorkflowRunner(router=r5_router, stat_engine=r5_engine).run(
+    r5_res = AuditWorkflowRunner(router=r5_router).run(
         data_path=csv_path, raw_claim=raw_claim, claim_spec=claim_spec, persist_outputs=True
     )
     return r2_res, r5_res
+
+
+@contextmanager
+def _uploaded_csv(upload):
+    limit = int(load_sandbox_config()["max_file_size_mb"] * 1024 * 1024)
+    data = upload.getbuffer()
+    if len(data) > limit:
+        raise SecurityError("上传文件超出 CSV 大小限制")
+    root = sandbox_root(INPUTS_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=root) as directory:
+        path = Path(directory) / "upload.csv"
+        path.write_bytes(data)
+        yield path
 
 
 def main() -> None:
@@ -73,6 +88,7 @@ def main() -> None:
     st.title("数证 Audit — 多 Agent 证据核验与确定性裁决观测台")
     st.caption("辩论发现待验证问题 · 白名单 MCP 确定性取证 · 规则引擎独立裁决")
 
+    uploaded = None
     with st.sidebar:
         mode = st.radio("数据源模式", ["内置反转案例一键演示", "自定义上传 CSV"])
         budget = st.slider("单任务预算上限 (CNY)", 0.1, 5.0, 1.0, 0.1)
@@ -85,10 +101,6 @@ def main() -> None:
             default_claim = "发券组商户订单量高于未发券组。"
             default_ctx = ""
             csv_path = None
-            if uploaded is not None:
-                INPUTS_DIR.mkdir(parents=True, exist_ok=True)
-                csv_path = INPUTS_DIR / uploaded.name
-                csv_path.write_bytes(uploaded.getvalue())
 
         claim_text = st.text_area("待审业务声明", value=default_claim, height=80)
         context_text = st.text_area("背景说明（可选）", value=default_ctx, height=70)
@@ -97,11 +109,19 @@ def main() -> None:
     if not run_btn:
         st.info("请在左侧选择内置案例或上传 CSV，点击「开始审计与 R2 vs R5 对比」。")
         return
-    if csv_path is None:
+    if csv_path is None and uploaded is None:
         st.warning("请先上传 CSV 文件。")
         return
 
-    r2_res, r5_res = _run_r2_vs_r5(csv_path, claim_text, context_text, budget)
+    try:
+        if uploaded is not None:
+            with _uploaded_csv(uploaded) as path:
+                r2_res, r5_res = _run_r2_vs_r5(path, claim_text, context_text, budget)
+        else:
+            r2_res, r5_res = _run_r2_vs_r5(csv_path, claim_text, context_text, budget)
+    except (SecurityError, ValueError) as exc:
+        st.error(str(exc))
+        return
     r2_v, r5_v, r5_state = r2_res["verdict"], r5_res["verdict"], r5_res["state"]
     inv_ok, violations = check_invariants(r5_state)
 
@@ -111,13 +131,12 @@ def main() -> None:
     col3.metric("6 条全局不变量", "全部通过" if inv_ok else f"告警 ({len(violations)})")
 
     st.subheader("6 条不变量合规徽章")
-    b1, b2, b3, b4, b5, b6 = st.columns(6)
-    b1.success(f"round={r5_state.round} <= 2")
-    b2.success(f"judge={r5_state.judge_calls} <= 1")
-    b3.success(f"dup_tool={r5_state.duplicate_tool_executions}")
-    b4.success(f"invalid_ev={r5_state.invalid_evidence_accepted}")
-    b5.success(f"override={r5_state.judge_rule_overrides}")
-    b6.success(f"post_term={r5_state.tool_calls_after_terminal}")
+    limits = {"round": 2, "judge_calls": 1, "duplicate_tool_executions": 0,
+              "invalid_evidence_accepted": 0, "judge_rule_overrides": 0, "tool_calls_after_terminal": 0}
+    for column, (name, limit) in zip(st.columns(6), limits.items()):
+        value = getattr(r5_state, name)
+        display = column.success if value <= limit else column.error
+        display(f"{name}={value} (≤{limit})")
 
     st.subheader("MCP 确定性证据账本")
     ev_rows = [

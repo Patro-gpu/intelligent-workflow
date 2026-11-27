@@ -7,14 +7,14 @@ from collections import Counter
 import json
 from pathlib import Path
 
-from data.generate_benchmark import FIXTURES_FULL_DIR, generate_full_fixtures
+from data.generate_benchmark import generate_full_fixtures
 from evals.run_ablation import run_ablation
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_full_benchmark_generates_20_stratified_cases() -> None:
-    manifest = generate_full_fixtures(FIXTURES_FULL_DIR, seed=42)
+def test_full_benchmark_generates_20_stratified_cases(tmp_path: Path) -> None:
+    manifest = generate_full_fixtures(tmp_path, seed=42)
     assert manifest["case_count"] == 20
     assert len(manifest["cases"]) == 20
 
@@ -26,7 +26,7 @@ def test_full_benchmark_generates_20_stratified_cases() -> None:
     assert counts["missing_confounder"] == 4
     assert counts["security_redteam_injection"] + counts["security_redteam_corrupted_values"] == 2
 
-    manifest_file = FIXTURES_FULL_DIR / "manifest.json"
+    manifest_file = tmp_path / "manifest.json"
     assert manifest_file.exists()
     loaded = json.loads(manifest_file.read_text(encoding="utf-8"))
     assert loaded["case_count"] == 20

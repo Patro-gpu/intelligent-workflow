@@ -1,9 +1,52 @@
-# HANDOFF.md — 《数证 Audit》阶段 A → 阶段 B 交接看板
+# HANDOFF.md — 《数证 Audit》工程交接
 
-> **当前里程碑**：`v0.1-contracts-frozen`（阶段 A 全部完成，等待阶段 B 接力）
+> **最终审核基线**　`dev@556aece`，集成分支 `feat/final-mcp-live-review`。下方“阶段 A/B”部分保留历史记录。
 > **单点真相源**：[`docs/BLUEPRINT_v2.md`](./docs/BLUEPRINT_v2.md) ｜ **工程红线**：[`AGENTS.md`](./AGENTS.md)
 
 ---
+
+## 最终审核与发布准备（2026-11-27）
+
+| 审核项 | 发现与处理 |
+| --- | --- |
+| 辩论、取证、裁决 | 移除 R5 评测器对结果的二次改判。规则引擎按已登记指标与分组核算，百分比增长按基期、当期的两条求和证据计算。终裁修正须与候选关系、规则和具体证据相符，裁决统一经过 `classify`。 |
+| 安全列与文件 | 恶意表头曾出现在展示名中，上传名曾直接参与写盘。盲审只接收安全列描述，上传采用每次审计独立的临时 CSV。读取同一份限长快照计算哈希并解析，检查目录重定向，收紧报告、证据与日志的写入路径。 |
+| 双轨与降级 | 双角色各自从相同输入盲审。主路失败、重试和 Qwen 降级均按次计入预算，两角色落到同一提供方时记录 `model_diversity_lost`。真实模型响应须通过严格 JSON 校验。 |
+| 六条不变量 | 修复可覆盖状态位的测试入口、隐式默认参数造成的重复调用、工具未完成时仍判齐备、跨运行复用账本。证据入账前核对申明、数据哈希、工具及版本、请求与结果哈希。终态、轮次和终裁次数有独立守卫。 |
+| 契约与四个 Skill | `core/schema.py` 与基线逐字节一致。16 个本地契约模型均采用 `extra="forbid"`。四个独立 CLI 均有验收用例。 |
+| 真实 MCP | 默认工作流、R2/R5 及观测台经官方 Python SDK 的 stdio 发现五个工具。服务端启动时绑定数据快照和运行 ID，原始参数通过 JSON Schema 后才执行。轨迹包含发现与调用的耗时。 |
+| 密钥和原始数据 | 收紧占位符豁免，扫描 Git 索引及工作区，Git 命令失败会返回错误。`.env` 变体及上传目录已排除。对审核基线所有可达提交的 88 个唯一文件对象按扫描规则核验，0 告警。 |
+
+### 复验入口
+
+```bash
+python -m pip install -e ".[ui]"
+pytest -v
+python scripts/check_secrets.py
+python -m evals.run_ablation --scale full
+streamlit run app/dashboard.py
+```
+
+验收环境为 Python 3.11.3、官方 MCP 1.30.0。项目依赖限定到 SDK v1，服务端使用该系列的 FastMCP 接口。在真实 stdio 下，Case 03 未分层差为 48，两个层内差均为 0。基于相同数据，总体均值方向命题为 `verified`，因果增量命题为 `contradicted`。Case 04 的 5% 缩尾将差值从 48 降到 18.188，衰减 62.1083%。Case 06/07 覆盖恶意表头、非法参数、跨运行取证和非有限值。Streamlit 健康检查返回 HTTP 200，内置 Case 03 按钮完成整条审计，自定义上传 Case 04 得到 `limited`。
+
+最终 `MOCK_MODE=true pytest -v` 通过 74/74 项（171.83 秒），`python scripts/check_secrets.py` 报告 0 告警。在 20 个基准案例上，离线 Mock 模型配合真实 stdio 得到 R0 40%、R1 25%、R2 45%、R5 100% 的裁决准确率。R5 误判 `verified` 率为 0%，六条不变量通过率为 100%。每组逐案结果位于 `workspace/outputs/evals/ablation_results.csv`。
+
+### 在线实验
+
+在部署机的仓库根目录复制 `.env.example` 为 `.env`，设置 DeepSeek、豆包、Qwen 凭据、模型与对应服务地址。先核实 `configs/models.yaml` 中的计费单价，再执行小规模实验。
+
+```bash
+python -m evals.run_ablation --scale mvp --live --budget-cny 1.0
+```
+
+在线实验共享一个费用上限，取配置预算与命令行上限的较小值。按配置单价逐请求预留，失败或用量未知时保留预算占用。在线运行写入 `workspace/outputs/evals/live/<运行目录>/`，预算中断可查看 `ablation_results.partial.csv`。离线统计输出在 `workspace/outputs/evals/`。本机使用官方模型 SDK 向本地 HTTP 测试服务发送四次请求，验证了双角色请求格式、JSON 模式和用量记账。专项测试另覆盖并发预留、降级与熔断。供应商端连通性、模型质量与实际账单待配置真实凭据后验证。
+
+### dev → main 发布清单
+
+- [ ] 将已验收的本地 `dev` 以普通推送同步到远端，核对合并提交 SHA。若远端已有新提交，先集成并复验。
+- [ ] 在带真实凭据的环境执行上面的小规模在线消融，核对模式标记、响应契约、费用和降级记录。
+- [ ] 以 `dev` 为来源、`main` 为目标创建发布 PR，附合并 SHA、测试结果、密钥扫描结果与消融报告。
+- [ ] 审查通过后合并 PR，在 `main` 重跑 Case 03、Case 04 与观测台健康检查。若需回退，使用合并提交的 revert。
 
 ## 一、阶段 A（U1 & U2）完成清单
 

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import pytest
+
+from core.security import SecurityError
 from pathlib import Path
 
 from core.schema import (
@@ -32,7 +35,7 @@ def _base_state(claim_id: str, evidence: list[EvidenceRecord], issues: list[Issu
     return WorkflowState(
         run_id="run_test",
         claim_id=claim_id,
-        dataset_hash="hash_test",
+        dataset_hash="h",
         evidence={ev.evidence_id: ev for ev in evidence},
         issues={iss.issue_id: iss for iss in (issues or [])},
     )
@@ -173,7 +176,7 @@ def test_validate_judge_output_blocks_overreach_and_fake_evidence() -> None:
         unresolved_issue_id="iss_1",
         issue_type="evidence_mapping",
         claim_spec=claim,
-        candidate_interpretations=[{"candidate_id": "cand_a", "summary": "A"}],
+        candidate_interpretations=[{"candidate_id": "cand_a", "relation": "supports", "rule_id": "r1", "cited_evidence_ids": ["ev_001"]}],
         admissible_evidence=[ev_ok],
     )
 
@@ -231,7 +234,7 @@ def test_validate_judge_output_blocks_overreach_and_fake_evidence() -> None:
     assert reasons_valid == []
 
 
-def test_markdown_report_and_cli_report(tmp_path: Path) -> None:
+def test_markdown_report_and_cli_report(tmp_path: Path, monkeypatch) -> None:
     claim = ClaimSpec(
         claim_id="c_ok",
         raw_text="发券组订单均值高于未发券组。",
@@ -270,6 +273,40 @@ def test_markdown_report_and_cli_report(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    monkeypatch.setattr("skills.skill_4_evidence_auditor.cli.OUTPUT_ROOT", tmp_path)
     rc = cli_main(["report", "--input", str(bundle_path), "--output", str(out_md)])
     assert rc == 0
     assert "`VERIFIED`" in out_md.read_text(encoding="utf-8")
+
+
+def test_foreign_or_irrelevant_receipts_and_prepopulated_flags_cannot_verify_claim() -> None:
+    claim = ClaimSpec(claim_id="orders", raw_text="orders increased", claim_type="direction",
+                      metric="orders_mean_diff", direction="increase")
+    rec = EvidenceRecord(evidence_id="receipt", tool_id="aggregate", dataset_hash="h",
+                         claim_id=claim.claim_id, result={"metric": "count", "value": 42})
+    for evidence in ([rec], [rec.model_copy(update={"dataset_hash": "foreign"})], []):
+        state = _base_state(claim.claim_id, evidence)
+        state.decisive_refutation = state.full_claim_supported = True
+        checked = evaluate_evidence_rules(claim, state)
+        assert classify(checked) == VerdictStatus.INSUFFICIENT
+
+
+def test_report_path_rejected_before_creating_parent(tmp_path, monkeypatch) -> None:
+    claim = ClaimSpec(claim_id="c", raw_text="", claim_type="descriptive", metric="unknown")
+    state = _base_state("c", [])
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text(json.dumps({"claim_spec": claim.model_dump(), "workflow_state": state.model_dump()}))
+    monkeypatch.setattr("skills.skill_4_evidence_auditor.cli.OUTPUT_ROOT", tmp_path / "sandbox")
+    with pytest.raises(SecurityError):
+        cli_main(["report", "--input", str(bundle), "--output", "../outside/report.md"])
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize("metric,scope", [("revenue_mean_diff", "global"), ("orders_mean_diff", "region")])
+def test_required_subclaim_needs_its_own_estimand(metric, scope) -> None:
+    claim = ClaimSpec(claim_id="orders", raw_text="", claim_type="direction", metric="orders_mean_diff",
+                      direction="increase", sub_claims=[SubClaim(sub_claim_id="second", claim_type="direction",
+                      metric=metric, scope_id=scope, direction="increase")])
+    ev = EvidenceRecord(evidence_id="ev", claim_id=claim.claim_id, dataset_hash="h", tool_id="group_compare",
+                        result={"diff": 48, "p_value": 0.001})
+    assert classify(evaluate_evidence_rules(claim, _base_state(claim.claim_id, [ev]))) == VerdictStatus.INSUFFICIENT

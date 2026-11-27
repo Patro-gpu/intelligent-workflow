@@ -17,19 +17,8 @@
 - 若原句同时包含幅度与因果断言（如“发放消费券使订单增加了 48 单”），主命题标记为 `causal`，并将幅度部分与因果识别部分拆为 `sub_claims`。
 - 若原句或上下文提示存在潜在混淆因素（如同期大促），必须原样保留在 `context_notes` 中。
 
-## 输出格式（严格 JSON）
-```json
-{
-  "claim_id": "string",
-  "raw_text": "string",
-  "claim_type": "descriptive|direction|magnitude|universal|causal",
-  "metric": "string",
-  "direction": "increase|decrease|none|null",
-  "target_value": 0.0,
-  "unit": "string|null",
-  "scope_id": "global",
-  "time_window": "string|null",
-  "context_notes": "string",
-  "sub_claims": []
-}
-```
+## 输出格式
+
+返回单个 JSON 对象，使用双引号，无代码围栏和解释。逐字复制输入的 claim_id 与 raw_text。claim_type 从上方枚举中选一个值。direction 取 "increase"、"decrease" 或 JSON null。缺少的数值和单位填 JSON null，不得用零代指缺失。比较发券组和对照组订单均值时 metric 取 orders_mean_diff，营收基期和当期增长率取 revenue_growth_rate。其他指标给出对应列及统计量，例如 revenue_sum。以下示例展示字段类型。
+
+{"claim_id":"c1","raw_text":"订单增加","claim_type":"direction","metric":"orders","direction":"increase","target_value":null,"unit":null,"scope_id":"global","time_window":null,"context_notes":"","sub_claims":[]}

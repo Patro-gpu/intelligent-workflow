@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
+from io import BytesIO, TextIOWrapper
+import csv
+from pathlib import Path, PureWindowsPath
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +37,21 @@ _PROMPT_INJECTION_HINTS = (
 )
 
 
+def validate_run_id(run_id: str) -> str:
+    """Use the same portable run identifier in the ledger, trace and report paths."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id) or PureWindowsPath(run_id).is_reserved():
+        raise SecurityError("Invalid run identifier")
+    return run_id
+
+
+def sandbox_root(path: str | Path) -> Path:
+    """Reject a configured directory redirected through a link or junction."""
+    root = Path(path).expanduser().absolute()
+    if root.resolve() != root:
+        raise SecurityError("Sandbox root must not be redirected")
+    return root
+
+
 def resolve_safe_path(
     path: str | Path,
     allowed_roots: Sequence[str | Path],
@@ -44,23 +61,9 @@ def resolve_safe_path(
         raise SecurityError("allowed_roots must not be empty")
 
     candidate = Path(path).expanduser().resolve()
-    resolved_roots = [Path(root).expanduser().resolve() for root in allowed_roots]
-
-    for root in resolved_roots:
-        try:
-            if candidate == root or candidate.is_relative_to(root):
-                return candidate
-        except AttributeError:
-            # Fallback if ever run on an older runtime without Path.is_relative_to
-            try:
-                candidate.relative_to(root)
-                return candidate
-            except ValueError:
-                continue
-
-    raise SecurityError(
-        f"Path '{path}' resolves to '{candidate}', which is outside allowed roots."
-    )
+    if any(candidate.is_relative_to(sandbox_root(root)) for root in allowed_roots):
+        return candidate
+    raise SecurityError("Path is outside allowed roots")
 
 
 def sanitize_cell_for_export(value: Any) -> Any:
@@ -114,7 +117,7 @@ class DatasetRegistry:
     ) -> None:
         if not allowed_roots:
             raise SecurityError("DatasetRegistry requires at least one allowed root")
-        self.allowed_roots: List[Path] = [Path(r).expanduser().resolve() for r in allowed_roots]
+        self.allowed_roots: List[Path] = [sandbox_root(r) for r in allowed_roots]
         self.max_file_size_bytes: int = int(max_file_size_mb * 1024 * 1024)
         self.max_rows: int = max_rows
         self.max_cols: int = max_cols
@@ -130,6 +133,8 @@ class DatasetRegistry:
     ) -> DatasetProfile:
         """安全校验、只读加载 CSV 并注册内部安全列 ID（`col_01`...）。"""
         safe_path = resolve_safe_path(file_path, self.allowed_roots)
+        if safe_path.suffix.lower() != ".csv":
+            raise SecurityError("Only uncompressed CSV inputs are accepted")
         if not safe_path.exists() or not safe_path.is_file():
             raise SecurityError(f"CSV file does not exist or is not a regular file: {safe_path}")
 
@@ -139,10 +144,29 @@ class DatasetRegistry:
                 f"File size {file_size} bytes exceeds limit of {self.max_file_size_bytes} bytes"
             )
 
-        raw_bytes = safe_path.read_bytes()
+        with safe_path.open("rb") as stream:
+            raw_bytes = stream.read(self.max_file_size_bytes + 1)
+        if len(raw_bytes) > self.max_file_size_bytes:
+            raise SecurityError("File exceeds byte limit")
         dataset_hash = hashlib.sha256(raw_bytes).hexdigest()
 
-        df = pd.read_csv(safe_path)
+        # Bound the dimensions before pandas allocates columns. Hash and parse the same snapshot.
+        width = None
+        try:
+            with TextIOWrapper(BytesIO(raw_bytes), encoding="utf-8-sig", newline="") as stream:
+                rows = (row for row in csv.reader(stream, strict=True) if row)
+                for index, row in enumerate(rows):
+                    if index > self.max_rows:
+                        raise SecurityError(f"Row count exceeds limit of {self.max_rows}")
+                    if width is None:
+                        width = len(row)
+                        if width > self.max_cols:
+                            raise SecurityError(f"Column count exceeds limit of {self.max_cols}")
+                    elif len(row) > width:
+                        raise SecurityError("Row contains fields outside the CSV header")
+        except (csv.Error, UnicodeError) as exc:
+            raise SecurityError("Invalid UTF-8 CSV input") from exc
+        df = pd.read_csv(BytesIO(raw_bytes), nrows=self.max_rows + 1)
         row_count, col_count = df.shape
         if row_count > self.max_rows:
             raise SecurityError(f"Row count {row_count} exceeds limit of {self.max_rows}")
@@ -150,9 +174,12 @@ class DatasetRegistry:
             raise SecurityError(f"Column count {col_count} exceeds limit of {self.max_cols}")
 
         assigned_id = dataset_id or f"ds_{dataset_hash[:12]}"
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", assigned_id):
+            raise SecurityError("Invalid dataset identifier")
+        if assigned_id in self._profiles and self._profiles[assigned_id].dataset_hash != dataset_hash:
+            raise SecurityError("Dataset identifier is already bound to different content")
         columns: List[ColumnMapping] = []
         col_map: Dict[str, ColumnMapping] = {}
-        rename_dict: Dict[Any, str] = {}
         quality_warnings: List[str] = []
         candidate_group_cols: List[str] = []
 
@@ -161,6 +188,10 @@ class DatasetRegistry:
             raw_col_str = str(raw_col)
             raw_name_hash = hashlib.sha256(raw_col_str.encode("utf-8")).hexdigest()
             sanitized_name = sanitize_column_name(raw_col_str)
+            suspicious = any(h in raw_col_str.casefold() for h in _PROMPT_INJECTION_HINTS)
+            if suspicious or raw_col_str.lstrip().startswith(_FORMULA_PREFIXES) or _CONTROL_CHAR_RE.search(raw_col_str):
+                sanitized_name = col_id
+                quality_warnings.append(f"{col_id}: suspicious header isolated via safe col_id mapping")
             series = df.iloc[:, idx - 1]
             role_hint = _infer_role_hint(series, sanitized_name)
 
@@ -173,19 +204,9 @@ class DatasetRegistry:
             )
             columns.append(mapping)
             col_map[col_id] = mapping
-            rename_dict[raw_col] = col_id
 
             if role_hint == "group":
                 candidate_group_cols.append(col_id)
-
-            # Check suspicious prompt-injection / formula headers
-            lowered_header = raw_col_str.lower()
-            if any(hint in lowered_header for hint in _PROMPT_INJECTION_HINTS) or raw_col_str.startswith(
-                _FORMULA_PREFIXES
-            ):
-                quality_warnings.append(
-                    f"{col_id}: suspicious header isolated via safe col_id mapping"
-                )
 
             # Check NaN and +/-Inf values
             nan_count = int(series.isna().sum())

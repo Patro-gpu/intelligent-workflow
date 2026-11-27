@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
             allowed_roots=[
                 REPO_ROOT / "data/fixtures",
                 REPO_ROOT / "workspace/inputs",
-                data_path.parent,
+                REPO_ROOT / "data/fixtures_full",
             ]
         )
         profile = registry.register_csv(data_path)

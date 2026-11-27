@@ -13,6 +13,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -37,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--stratify-col", default=None, help="Optional safe col_id for stratification")
     v.add_argument("--metric", default="mean", help="Metric enum")
     v.add_argument("--method", default="winsorize_5pct", help="Sensitivity check method enum")
-    v.add_argument("--run-id", default="cli_verify", help="Run identifier for evidence ledger")
+    v.add_argument("--run-id", default=f"cli_verify_{uuid4().hex}", help="Run identifier for evidence ledger")
 
     args = parser.parse_args(argv)
     if args.command == "verify":
